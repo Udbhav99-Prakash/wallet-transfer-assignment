@@ -49,11 +49,8 @@ func (r *ledgerRepository) CreateLedgerEntries(ctx context.Context, entries ...d
 		return domain.ErrInvalidLedgerPair
 	}
 
-	query := `
-		INSERT INTO ledger_entries (id, transfer_id, wallet_id, type, amount, created_at)
-		VALUES ($1, $2, $3, $4, $5, $6)
-	`
-	for _, entry := range entries {
+	if len(entries) == 1 {
+		entry := entries[0]
 		id := entry.ID
 		if id == "" {
 			id = uuid.NewString()
@@ -66,17 +63,51 @@ func (r *ledgerRepository) CreateLedgerEntries(ctx context.Context, entries ...d
 		if entry.TransferID != "" {
 			transferID = &entry.TransferID
 		}
-		_, err := r.db.Exec(ctx, query,
-			id,
-			transferID,
-			entry.WalletID,
-			string(entry.Type),
-			entry.Amount,
-			now,
-		)
-		if err != nil {
+		query := `
+			INSERT INTO ledger_entries (id, transfer_id, wallet_id, type, amount, created_at)
+			VALUES ($1, $2, $3, $4, $5, $6)
+		`
+		if _, err := r.db.Exec(ctx, query, id, transferID, entry.WalletID, string(entry.Type), entry.Amount, now); err != nil {
 			return fmt.Errorf("failed to create ledger entry: %w", err)
 		}
+		return nil
+	}
+
+	// len(entries) == 2: insert both entries atomically in a single multi-row statement.
+	// This guarantees atomicity even when executed against a connection pool outside an explicit transaction,
+	// allowing deferred pair constraint triggers to validate the complete pair.
+	e1, e2 := entries[0], entries[1]
+	id1, id2 := e1.ID, e2.ID
+	if id1 == "" {
+		id1 = uuid.NewString()
+	}
+	if id2 == "" {
+		id2 = uuid.NewString()
+	}
+	now1, now2 := e1.CreatedAt, e2.CreatedAt
+	if now1.IsZero() {
+		now1 = time.Now().UTC()
+	}
+	if now2.IsZero() {
+		now2 = time.Now().UTC()
+	}
+	var tID1, tID2 *string
+	if e1.TransferID != "" {
+		tID1 = &e1.TransferID
+	}
+	if e2.TransferID != "" {
+		tID2 = &e2.TransferID
+	}
+
+	query := `
+		INSERT INTO ledger_entries (id, transfer_id, wallet_id, type, amount, created_at)
+		VALUES ($1, $2, $3, $4, $5, $6), ($7, $8, $9, $10, $11, $12)
+	`
+	if _, err := r.db.Exec(ctx, query,
+		id1, tID1, e1.WalletID, string(e1.Type), e1.Amount, now1,
+		id2, tID2, e2.WalletID, string(e2.Type), e2.Amount, now2,
+	); err != nil {
+		return fmt.Errorf("failed to create ledger entries: %w", err)
 	}
 	return nil
 }

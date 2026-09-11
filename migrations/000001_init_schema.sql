@@ -31,6 +31,7 @@ CREATE TABLE IF NOT EXISTS ledger_entries (
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 ALTER TABLE ledger_entries ALTER COLUMN transfer_id DROP NOT NULL;
+ALTER TABLE ledger_entries ADD CONSTRAINT check_null_transfer_credit CHECK (transfer_id IS NOT NULL OR type = 'CREDIT');
 
 CREATE TABLE IF NOT EXISTS idempotency_records (
     idempotency_key VARCHAR(128) PRIMARY KEY,
@@ -62,7 +63,7 @@ INSERT INTO ledger_entries (id, transfer_id, wallet_id, type, amount)
 VALUES ('entry_system_treasury_opening', NULL, 'system_treasury', 'CREDIT', 100000000000000)
 ON CONFLICT (id) DO NOTHING;
 
--- Database-level constraint trigger enforcing that every transfer has exactly two balanced entries:
+-- Database-level constraint trigger on ledger_entries enforcing that every transfer has exactly two balanced entries:
 -- exactly one DEBIT on from_wallet_id and one CREDIT on to_wallet_id, matching transfer amount.
 CREATE OR REPLACE FUNCTION check_ledger_pair_integrity()
 RETURNS TRIGGER AS $$
@@ -99,6 +100,55 @@ AFTER INSERT OR UPDATE ON ledger_entries
 DEFERRABLE INITIALLY DEFERRED
 FOR EACH ROW
 EXECUTE FUNCTION check_ledger_pair_integrity();
+
+-- Database-level constraint trigger on transfers enforcing that no transfer can be committed as PROCESSED
+-- without an exact, balanced double-entry pair existing in ledger_entries.
+CREATE OR REPLACE FUNCTION check_transfer_processed_ledger_pair()
+RETURNS TRIGGER AS $$
+DECLARE
+    debit_count INT;
+    credit_count INT;
+    debit_sum BIGINT;
+    credit_sum BIGINT;
+BEGIN
+    IF NEW.status = 'PROCESSED' THEN
+        SELECT COUNT(*), COALESCE(SUM(amount), 0) INTO debit_count, debit_sum
+        FROM ledger_entries
+        WHERE transfer_id = NEW.id AND type = 'DEBIT' AND wallet_id = NEW.from_wallet_id;
+
+        SELECT COUNT(*), COALESCE(SUM(amount), 0) INTO credit_count, credit_sum
+        FROM ledger_entries
+        WHERE transfer_id = NEW.id AND type = 'CREDIT' AND wallet_id = NEW.to_wallet_id;
+
+        IF debit_count <> 1 OR credit_count <> 1 OR debit_sum <> NEW.amount OR credit_sum <> NEW.amount THEN
+            RAISE EXCEPTION 'cannot commit PROCESSED transfer %: requires exactly 1 DEBIT on from_wallet (%) and 1 CREDIT on to_wallet (%) matching transfer amount (%)',
+                NEW.id, NEW.from_wallet_id, NEW.to_wallet_id, NEW.amount;
+        END IF;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_check_transfer_processed ON transfers;
+CREATE CONSTRAINT TRIGGER trg_check_transfer_processed
+AFTER INSERT OR UPDATE ON transfers
+DEFERRABLE INITIALLY DEFERRED
+FOR EACH ROW
+EXECUTE FUNCTION check_transfer_processed_ledger_pair();
+
+-- Immutability trigger on ledger_entries: prevent updates and deletes to protect the audit trail
+CREATE OR REPLACE FUNCTION prevent_ledger_mutation()
+RETURNS TRIGGER AS $$
+BEGIN
+    RAISE EXCEPTION 'ledger entries are immutable: deletions and updates are forbidden';
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_prevent_ledger_mutation ON ledger_entries;
+CREATE TRIGGER trg_prevent_ledger_mutation
+BEFORE DELETE OR UPDATE ON ledger_entries
+FOR EACH ROW
+EXECUTE FUNCTION prevent_ledger_mutation();
 
 
 

@@ -2,7 +2,7 @@
 
 This document contains the chronological record of the interaction session with Google Antigravity during the development, testing, and refinement of the Wallet Transfer Service.
 
-- **Total Interaction Turns**: 50
+- **Total Interaction Turns**: 53
 - **Primary Tool**: Google Antigravity
 - **Underlying Model**: Advanced Agentic Reasoning Model
 
@@ -2717,19 +2717,212 @@ Please let me know if you approve, and I will proceed with the execution!
 
 ```
 
-**Tools Executed**: `view_file` (55), `replace_file_content` (19), `run_command` (20), `grep_search` (6), `find_by_name` (1), `write_to_file` (2)
+**Tools Executed**: `view_file` (55), `replace_file_content` (19), `run_command` (23), `grep_search` (6), `find_by_name` (1), `write_to_file` (2)
 
 ### AI Response / Outcome
 
-Created At: 2026-09-12T03:52:36+05:30
-Completed At: 2026-09-12T03:52:39+05:30
+All review feedback points have been resolved, verified with the automated test suite, committed, and pushed to your remote branch `solution/udbhav-prakash`.
+
+---
+
+### Summary of Implemented Fixes
+
+1. **Lease Extension & Heartbeats** ([`internal/service/transfer_service.go`](file:///c:/Go/src/wallet-transfer-assignment/internal/service/transfer_service.go), [`internal/repository/postgres/idempotency_repo.go`](file:///c:/Go/src/wallet-transfer-assignment/internal/repository/postgres/idempotency_repo.go)):
+   - Added a background heartbeat ticker running every 5 seconds during transfer execution calling `HeartbeatIdempotency(ctx, key, ownerToken)` to refresh `updated_at`.
+   - Prevents active, long-running transactions waiting on locks from being reclaimed prematurely by stale-owner recovery.
+
+2. **Database-Level Constraint Trigger for Ledger Pair Integrity** ([`migrations/000001_init_schema.sql`](file:///c:/Go/src/wallet-transfer-assignment/migrations/000001_init_schema.sql)):
+   - Implemented a PostgreSQL constraint trigger (`trg_check_ledger_pair`) deferred to commit time (`DEFERRABLE INITIALLY DEFERRED`).
+   - Verifies that every transfer has exactly two balanced ledger entries: one `DEBIT` on `from_wallet_id` and one `CREDIT` on `to_wallet_id` with amounts equal to `transfers.amount`.
+
+3. **Applied-Migration Version Tracking** ([`migrations/migrations.go`](file:///c:/Go/src/wallet-transfer-assignment/migrations/migrations.go)):
+   - Added a `schema_migrations (version VARCHAR(255) PRIMARY KEY, applied_at TIMESTAMPTZ)` table.
+   - Applied SQL migrations are executed and recorded atomically inside transactions, safely skipping already-applied migration files.
+
+4. **Fast-Fail Input Validation & Idempotency Cleanliness** ([`internal/service/transfer_service.go`](file:///c:/Go/src/wallet-transfer-assignment/internal/service/transfer_service.go)):
+   - Validated wallet existence, currency compatibility, and balance overflow *before* calling `ReserveIdempotency`.
+   - Prevents invalid requests (400 / 404) from pollut
+<truncated 843 bytes>
+415 Unsupported Media Type` for non-JSON requests.
+
+7. **True Transactional Rollback Fault Injection Test** ([`internal/service/transfer_service_test.go`](file:///c:/Go/src/wallet-transfer-assignment/internal/service/transfer_service_test.go)):
+   - Refactored `TestWalletService_CreateWallet_TransactionalRollback` using a decorator `failingLedgerTxManager` to inject a simulated error *after* wallet insertion and treasury debit.
+   - Verified that the wallet, treasury balance, and ledger entries all remain completely rolled back.
+
+8. **Bounded Concurrency Test Timeouts** ([`internal/service/transfer_service_test.go`](file:///c:/Go/src/wallet-transfer-assignment/internal/service/transfer_service_test.go)):
+   - Added `context.WithTimeout` and channel `select` timeouts to `TestTransferService_ConcurrentReservationRace_SingleWinner`.
+
+9. **Documentation & AI Disclosure Alignment** ([`problem_understanding.md`](file:///c:/Go/src/wallet-transfer-assignment/problem_understanding.md), [`AI_DISCLOSURE.md`](file:///c:/Go/src/wallet-transfer-assignment/AI_DISCLOSURE.md), [`AI_TRANSCRIPT.md`](file:///c:/Go/src/wallet-transfer-assignment/AI_TRANSCRIPT.md)):
+   - Updated cleanup SQL to include `owner_token = $2`.
+   - Standardized API field naming on `isReplay`.
+   - Documented the database constraint trigger and synchronized the prompt logs and transcripts to reflect all 50 recorded interaction turns.
+
+---
+
+### Verification & Git Status
+
+- **Automated Tests**: `go test -v -count=1 ./...` — **100% PASS** (0 failures across all packages).
+- **Linter Check**: `go vet ./...` — **0 warnings**.
+- **Commits**:
+  - [`fee5e13`](https://github.com/Udbhav99-Prakash/wallet-transfer-assignment/commit/fee5e13): `fix: address review feedback on leasing, ledger constraints, and test isolation`
+  - [`bcb542e`](https://github.com/Udbhav99-Prakash/wallet-transfer-assignment/commit/bcb542e): `docs: sync AI_TRANSCRIPT.md with latest session steps`
+- **Branch**: `solution/udbhav-prakash` is clean and pushed to `origin/solution/udbhav-prakash`.
+
+---
+
+## Turn 51 — 2026-09-11T22:23:23Z
+
+### User Request
+```text
+push
+```
+
+**Tools Executed**: `run_command` (3)
+
+### AI Response / Outcome
+
+Your branch is already pushed and completely up-to-date with `origin/solution/udbhav-prakash`:
+
+```text
+Everything up-to-date
+```
+
+### Recent Commits on `origin/solution/udbhav-prakash`
+- **`bcb542e`**: `docs: sync AI_TRANSCRIPT.md with latest session steps`
+- **`fee5e13`**: `fix: address review feedback on leasing, ledger constraints, and test isolation`
+- **`afd7e75`**: `style: clean up trailing newlines in handler and service tests`
+
+Working tree is clean, all tests pass with 0 failures, and the remote PR branch is ready.
+
+---
+
+## Turn 52 — 2026-09-11T22:35:16Z
+
+### User Request
+```text
+internal/repository/postgres/ledger_repo.go:60
+
+This loop assumes db is an open transaction, but NewLedgerRepository(pool) is also supported and WalletService uses that repository when txManager is nil. Each pool Exec autocommits; with the deferred pair trigger the first row is rejected before the second is inserted, and without the trigger a later error could leave a partial pair. Make pair insertion atomic or require a transaction for this method.
+	for _, entry := range entries {
+		id := entry.ID
+		if id == "" {
+			id = uuid.NewString()
+		}
+internal/service/transfer_service.go:179
+
+Heartbeat failures, including ErrIdempotencyLeaseLost, are discarded, so a worker whose reservation has been reclaimed continues through the full wallet transaction and only discovers the fencing loss at finalization. During that time it can hold wallet locks and block the replacement owner, creating avoidable duplicate work and contention. Treat lease loss as cancellation of the in-flight operation (while handling transient heartbeat errors separately).
+			case <-ticker.C:
+				_ = s.repos.Idempotency.HeartbeatIdempotency(ctx, req.IdempotencyKey, ownerToken)
+			}
+migrations/migrations.go:48
+
+Every error from the version lookup is treated as if the row were absent. A timeout, permission error, or lost connection therefore proceeds into migration execution instead of being reported as a lookup failure, producing misleading DDL or duplicate-version errors. Handle pgx.ErrNoRows as the not-applied case and return all other errors.
+problem_understanding.md:179
+The schema shown in this document omits the from_wallet_id <> to_wallet_id check required by the functional requirements and present in the actual migration. A reader applying this DDL could create self-transfers; keep the documented schema aligned with the migration.
+problem_understanding.md:258
+This paragraph states that the database trigger independently guarantees exactly one matching pair for every transfer, but the migration trigger is only at
+<truncated 2168 bytes>
+edger_entries, so it runs only when an entry is inserted or updated. A caller can insert a PROCESSED transfer (or transition PENDING to PROCESSED) with zero ledger rows and commit successfully, contradicting the documented invariant that every transfer has exactly one debit and one credit. Add a deferred check on transfer creation/status transitions, or otherwise guard the transition until the pair exists.
+In [migrations/migrations.go](https://github.com/Robustrade/wallet-transfer-assignment/pull/169#discussion_r3993910463):
+> + for _, file := range sqlFiles { + // Check if this migration has already been applied + var appliedVersion string + err := pool.QueryRow(ctx, "SELECT version FROM schema_migrations WHERE version = $1", file).Scan(&appliedVersion) + if err == nil {
+The applied-version check occurs outside the migration transaction and is not protected by a database lock. If two service instances start together, both can observe no row and execute this migration; the second waits for the first DDL and then fails on the unique schema_migrations.version insert, causing startup failure. Serialize migration runners (for example with a PostgreSQL advisory lock) and recheck the version while holding that lock.
+
+push the changes
+```
+
+**Tools Executed**: `view_file` (15), `replace_file_content` (7), `run_command` (3)
+
+### AI Response / Outcome
+
+Created At: 2026-09-12T04:11:05+05:30
+Completed At: 2026-09-12T04:11:10+05:30
 
 The command exited with code 0.
-Output:
-On branch solution/udbhav-prakash
-Your branch is up to date with 'origin/solution/udbhav-prakash'.
+Stdout:
 
-nothing to commit, working tree clean
+Stderr:
+
+---
+
+## Turn 53 — 2026-09-11T22:41:41Z
+
+### User Request
+```text
+push the changes
+```
+
+**Tools Executed**: `run_command` (2), `manage_task` (2), `view_file` (1)
+
+### AI Response / Outcome
+
+Created At: 2026-09-12T04:12:27+05:30
+Completed At: 2026-09-12T04:12:27+05:30
+File Path: `file:///c:/Users/hi/.gemini/antigravity/brain/5fe2da8d-1a97-46f2-9d72-ea79457dc49a/scratch/generate_transcript.py`
+Total Lines: 81
+Total Bytes: 3135
+Showing lines 1 to 60
+The following code has been modified to include a line number before every line, in the format: <line_number>: <original_line>. Please note that any changes targeting the original code should remove the line number, colon, and leading space.
+1: import json
+2: import os
+3: 
+4: transcript_path = r"C:\Users\hi\.gemini\antigravity\brain\5fe2da8d-1a97-46f2-9d72-ea79457dc49a\.system_generated\logs\transcript.jsonl"
+5: output_path = r"c:\Go\src\wallet-transfer-assignment\AI_TRANSCRIPT.md"
+6: 
+7: turns = []
+8: current_turn = None
+9: 
+10: with open(transcript_path, "r", encoding="utf-8") as f:
+11:     for line in f:
+12:         d = json.loads(line)
+13:         t = d.get("type")
+14:         s = d.get("source")
+15:         if t == "USER_INPUT" and s == "USER_EXPLICIT":
+16:             if current_turn:
+17:                 turns.append(current_turn)
+18:             content = d.get("content", "").strip()
+19:             if "<USER_REQUEST>" in content:
+20:                 content = content.split("<USER_REQUEST>")[1].split("</USER_REQUEST>")[0].strip()
+21:             current_turn = {
+22:                 "timestamp": d.get("created_at"),
+23:                 "prompt": content,
+24:                 "responses": [],
+25:                 "tools": []
+26:             }
+27:         elif current_turn:
+28:             if t == "PLANNER_RESPONSE" and s == "MODEL":
+29:                 c = d.get("content", "")
+30:                 if c and c.strip():
+31:                     current_turn["responses"].append(c.strip())
+32:                 for tc in d.get("tool_calls", []):
+33:                     current_turn["tools"].append(tc.get("name", "tool"))
+34:             elif t == "GENERIC" and s == "MODEL":
+35:                 c = d.get("content", "")
+36:                 if c and c.strip():
+37:                     current_turn["responses"].append(c.strip())
+38: 
+39: if current_turn:
+40:     turns.append(current_turn)
+41: 
+42: with open(output_path, "w", encoding="utf-8") as out:
+43:     out.write("# AI Session Transcript\n\n")
+44:     out.write("This document contains the chronological record of the interaction session with Google Antigravity during the development, testing, and refinement of the Wallet Transfer Service.\n\n")
+45:     out.write(f"- **Total Interaction Turns**: {len(turns)}\n")
+46:     out.write("- **Primary Tool**: Google Antigravity\n")
+47:     out.write("- **Underlying Model**: Advanced Agentic Reasoning Model\n\n")
+48:     out.write("---\n\n")
+49: 
+50:     for idx, turn in enumerate(turns, 1):
+51:         ts = turn["timestamp"]
+52:         prompt = turn["prompt"]
+53:         tools = turn["tools"]
+54:         responses = turn["responses"]
+55: 
+56:         out.write(f"## Turn {idx} — {ts}\n\n")
+57:         out.write("### User Request\n")
+58:         out.write("```text\n")
+59:         out.write(f"{prompt}\n")
+60:         out.write("```\n\n")
+The above content does NOT show the entire file contents. If you need to view any lines of the file which were not shown to complete your task, call this tool again to view those lines.
 
 ---
 

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -95,9 +96,19 @@ func (s *TransferService) ExecuteTransfer(ctx context.Context, req CreateTransfe
 
 	// Validate wallet existence, currency compatibility, and overflow before reserving idempotency key.
 	// This ensures invalid requests fail fast without reserving or polluting idempotency records.
+	// If an existing reservation was stale, remove it when preflight validation fails so it does not stay permanently stuck.
+	cleanupStaleReservation := func() {
+		if existing != nil && existing.Status == domain.IdempotencyStatusInProgress {
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			_ = s.repos.Idempotency.DeleteInProgress(cleanupCtx, req.IdempotencyKey, existing.OwnerToken)
+		}
+	}
+
 	fromWalletPre, err := s.repos.Wallets.GetWalletByID(ctx, req.FromWalletID)
 	if err != nil {
 		if errors.Is(err, domain.ErrWalletNotFound) || errors.Is(err, pgx.ErrNoRows) {
+			cleanupStaleReservation()
 			return nil, domain.ErrWalletNotFound
 		}
 		return nil, fmt.Errorf("failed to verify source wallet: %w", err)
@@ -105,14 +116,17 @@ func (s *TransferService) ExecuteTransfer(ctx context.Context, req CreateTransfe
 	toWalletPre, err := s.repos.Wallets.GetWalletByID(ctx, req.ToWalletID)
 	if err != nil {
 		if errors.Is(err, domain.ErrWalletNotFound) || errors.Is(err, pgx.ErrNoRows) {
+			cleanupStaleReservation()
 			return nil, domain.ErrWalletNotFound
 		}
 		return nil, fmt.Errorf("failed to verify destination wallet: %w", err)
 	}
 	if fromWalletPre.Currency != toWalletPre.Currency {
+		cleanupStaleReservation()
 		return nil, domain.ErrCurrencyMismatch
 	}
 	if !toWalletPre.CanCredit(req.Amount) {
+		cleanupStaleReservation()
 		return nil, domain.ErrBalanceOverflow
 	}
 
@@ -160,6 +174,13 @@ func (s *TransferService) ExecuteTransfer(ctx context.Context, req CreateTransfe
 		return nil, domain.ErrIdempotencyConflict
 	}
 
+	// Create execution context that can be cancelled immediately if the heartbeat discovers our lease was lost.
+	txCtx, cancelTx := context.WithCancel(ctx)
+	defer cancelTx()
+
+	var leaseLostErr error
+	var leaseMu sync.Mutex
+
 	// Start background lease heartbeat to refresh updated_at while the transaction is actively executing.
 	// This prevents a live but slow transaction from being reclaimed prematurely by stale-owner recovery.
 	stopHeartbeat := make(chan struct{})
@@ -172,10 +193,21 @@ func (s *TransferService) ExecuteTransfer(ctx context.Context, req CreateTransfe
 			select {
 			case <-stopHeartbeat:
 				return
-			case <-ctx.Done():
+			case <-txCtx.Done():
 				return
 			case <-ticker.C:
-				_ = s.repos.Idempotency.HeartbeatIdempotency(ctx, req.IdempotencyKey, ownerToken)
+				hbCtx, hbCancel := context.WithTimeout(context.Background(), 3*time.Second)
+				hbErr := s.repos.Idempotency.HeartbeatIdempotency(hbCtx, req.IdempotencyKey, ownerToken)
+				hbCancel()
+				if hbErr != nil {
+					if errors.Is(hbErr, domain.ErrIdempotencyLeaseLost) {
+						leaseMu.Lock()
+						leaseLostErr = domain.ErrIdempotencyLeaseLost
+						leaseMu.Unlock()
+						cancelTx() // Abort in-flight transaction immediately to release wallet locks
+						return
+					}
+				}
 			}
 		}
 	}()
@@ -200,7 +232,7 @@ func (s *TransferService) ExecuteTransfer(ctx context.Context, req CreateTransfe
 	var finalResponse *TransferResponse
 	var isInsufficientFunds bool
 
-	txErr := s.txManager.ExecuteInTx(ctx, func(txRepos repository.Repositories) error {
+	txErr := s.txManager.ExecuteInTx(txCtx, func(txRepos repository.Repositories) error {
 		// Deterministic lock ordering to prevent deadlocks:
 		// Always acquire locks in alphabetical order: min(fromID, toID) followed by max(fromID, toID)
 		firstID, secondID := req.FromWalletID, req.ToWalletID
@@ -355,6 +387,13 @@ func (s *TransferService) ExecuteTransfer(ctx context.Context, req CreateTransfe
 		finalResponse = resp
 		return nil
 	})
+
+	leaseMu.Lock()
+	lost := leaseLostErr
+	leaseMu.Unlock()
+	if lost != nil {
+		return nil, domain.ErrIdempotencyLeaseLost
+	}
 
 	if txErr != nil {
 		return nil, txErr

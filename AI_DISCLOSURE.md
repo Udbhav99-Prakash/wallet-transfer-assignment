@@ -48,7 +48,7 @@ Antigravity was employed as an active **pair programmer and systems design sound
 
 ## 3. Session Transcript & Prompt Records
 
-The complete transcript of all 50 interaction turns—including exact prompt text, tool invocations, and AI responses—is preserved in this repository:
+The complete transcript of all 53 interaction turns—including exact prompt text, tool invocations, and AI responses—is preserved in this repository:
 - **Readable Session Transcript**: [`AI_TRANSCRIPT.md`](./AI_TRANSCRIPT.md)
 - **Raw Agent Interaction Log**: Persisted in the session metadata logs.
 
@@ -56,7 +56,7 @@ The complete transcript of all 50 interaction turns—including exact prompt tex
 
 ## 4. Chronological List of All Prompts
 
-Below is the complete chronological log of all 50 explicit prompts provided during the development session:
+Below is the complete chronological log of all 53 explicit prompts provided during the development session:
 
 | # | Timestamp (UTC) | Phase | User Prompt |
 |---|---|---|---|
@@ -110,6 +110,9 @@ Below is the complete chronological log of all 50 explicit prompts provided duri
 | **48** | `2026-09-11 21:56:04` | Git & Commit | *commit* |
 | **49** | `2026-09-11 22:09:51` | Review Fixes | *[Follow-up Review Feedback on PR #169 covering lease heartbeats, database-level ledger constraints, migration version tracking, isolated test databases, terminal failure persistence, and test timeouts]* |
 | **50** | `2026-09-11 22:10:42` | Review Fixes | *execution, verification, and disclosure update* |
+| **51** | `2026-09-11 22:30:15` | Git & Commit | *push* |
+| **52** | `2026-09-11 22:35:10` | Review Fixes | *[Follow-up Review Feedback on PR #169 covering atomic multi-row ledger inserts, in-flight heartbeat lease cancellation, strict migration version lookup error handling, migration runner advisory locks, transfers table constraint triggers, and ledger immutability triggers]* |
+| **53** | `2026-09-11 22:41:41` | Git & Commit | *push the changes* |
 
 ---
 
@@ -120,20 +123,22 @@ The author is fully prepared to explain and defend every design decision and lin
 1. **Short-Committed Reservation Protocol & Owner-Token Lease Fencing**:
    - Why we insert `IN_PROGRESS` in an immediate short transaction rather than keeping an uncommitted lock open during the entire transfer: under burst retries, overlapping requests immediately receive `409 Conflict` without tying up database connection pool workers.
    - Stale-owner recovery & fencing: if a worker process crashes while holding an `IN_PROGRESS` reservation, reservations older than 30 seconds are reclaimed safely. To prevent slow/paused workers from corrupting or deleting state after a lease reclaim, every reservation and reclaim generates an `owner_token`. Updates and deferred cleanups are fenced by `owner_token`.
-   - Lease Heartbeats: while a transfer is actively running, a background heartbeat periodically refreshes `updated_at` every 5 seconds so live requests are never reclaimed prematurely.
+   - Lease Heartbeats & Active In-Flight Cancellation: while a transfer is actively running, a background heartbeat periodically refreshes `updated_at` every 5 seconds so live requests are never reclaimed prematurely. If heartbeat encounters `ErrIdempotencyLeaseLost`, it actively cancels the in-flight context (`cancelTx()`), instantly releasing row locks to prevent duplicate work or contention with the replacement owner.
 2. **Deterministic Deadlock Prevention**:
    - Why locking ordering is sorted lexicographically (`from_id < to_id ? (from, to) : (to, from)`): breaks the circular wait condition (Coffman condition) across concurrent bidirectional transfers.
    - Initial wallet funding locks `system_treasury` before inserting the user wallet to adhere strictly to the global lock hierarchy.
 3. **Double-Entry Ledger Integrity & Database-Level Constraints**:
    - Stored wallet balances are updated atomically alongside two ledger entries (`DEBIT` and `CREDIT`) within a single ACID transaction.
-   - Database-level composite unique indexes (`(transfer_id, type)` and `(transfer_id, wallet_id)`), together with a commit-deferred PostgreSQL constraint trigger (`trg_check_ledger_pair`), guarantee that every transfer produces exactly one matching DEBIT on `from_wallet_id` and one CREDIT on `to_wallet_id` equal to the transfer amount.
+   - Multi-row atomic SQL inserts (`INSERT INTO ledger_entries (...) VALUES (...), (...)`) guarantee statement-level atomicity even when invoked against connection pools without an explicit outer transaction.
+   - Database-level composite unique indexes (`(transfer_id, type)` and `(transfer_id, wallet_id)`), together with commit-deferred PostgreSQL constraint triggers (`trg_check_ledger_pair` on `ledger_entries` and `trg_check_transfer_processed` on `transfers`), guarantee that no transfer can commit with status `PROCESSED` without exactly one matching DEBIT on `from_wallet_id` and one CREDIT on `to_wallet_id` equal to the transfer amount.
+   - Immutability trigger (`trg_prevent_ledger_mutation`) strictly forbids any `UPDATE` or `DELETE` on `ledger_entries`, preserving the immutable financial audit log.
    - `ReconcileBalance` performs `SELECT ... FOR UPDATE` row locking on the wallet inside a transaction while aggregating ledger records, eliminating false concurrency mismatches.
 4. **Length-Delimited Preimage Hashing**:
    - Why `%d:%s:%d:%s:%d` prevents delimiter injection attacks across colon characters.
 5. **HTTP Status Code Fidelity on Replays**:
    - Caching `response_code` in `idempotency_records` so that a replayed successful transfer returns `201 Created` while a replayed overdraft returns `422 Unprocessable Entity`.
-6. **Applied Migration Version Tracking**:
-   - Schema migrations are recorded in a `schema_migrations (version, applied_at)` table inside an atomic transaction, guaranteeing forward-only, idempotent migration execution.
+6. **Applied Migration Version Tracking & Advisory Locking**:
+   - Schema migrations are recorded in a `schema_migrations (version, applied_at)` table inside an atomic transaction, protected by a dedicated PostgreSQL advisory lock (`SELECT pg_advisory_lock(888999)`), guaranteeing forward-only, idempotent migration execution across concurrent service instances. Strict `pgx.ErrNoRows` inspection ensures transient DB failures are never treated as unapplied migrations.
 7. **Test Database Isolation**:
    - Automated tests run against a dedicated `wallet_test_db`, isolated from application development databases.
 

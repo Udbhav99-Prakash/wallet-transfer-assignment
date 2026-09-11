@@ -3,11 +3,13 @@ package migrations
 import (
 	"context"
 	"embed"
+	"errors"
 	"fmt"
 	"io/fs"
 	"path/filepath"
 	"sort"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -18,6 +20,21 @@ var FS embed.FS
 
 // Migrate executes all embedded migration scripts in lexical order with atomic version tracking.
 func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
+	// Acquire a dedicated migration advisory lock to serialize concurrent application startups
+	lockConn, err := pool.Acquire(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to acquire connection for migration lock: %w", err)
+	}
+	defer lockConn.Release()
+
+	const migrationAdvisoryLockID = 888999
+	if _, err := lockConn.Exec(ctx, "SELECT pg_advisory_lock($1);", migrationAdvisoryLockID); err != nil {
+		return fmt.Errorf("failed to acquire migration advisory lock: %w", err)
+	}
+	defer func() {
+		_, _ = lockConn.Exec(context.Background(), "SELECT pg_advisory_unlock($1);", migrationAdvisoryLockID)
+	}()
+
 	// Create schema_migrations table if not exists to track applied versions
 	createTableQuery := `
 		CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -49,6 +66,9 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 		if err == nil {
 			// Already applied; skip safely
 			continue
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return fmt.Errorf("failed to check applied status for migration %s: %w", file, err)
 		}
 
 		content, err := FS.ReadFile(file)

@@ -180,7 +180,8 @@ CREATE TABLE transfers (
     status VARCHAR(32) NOT NULL CHECK (status IN ('PENDING', 'PROCESSED', 'FAILED')),
     failure_reason TEXT,
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
+    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT check_distinct_wallets CHECK (from_wallet_id <> to_wallet_id)
 );
 
 -- Double-entry ledger entries table
@@ -190,7 +191,8 @@ CREATE TABLE ledger_entries (
     wallet_id VARCHAR(64) NOT NULL REFERENCES wallets(id) ON DELETE RESTRICT,
     type VARCHAR(16) NOT NULL CHECK (type IN ('DEBIT', 'CREDIT')),
     amount BIGINT NOT NULL CHECK (amount > 0),
-    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT check_null_transfer_credit CHECK (transfer_id IS NOT NULL OR type = 'CREDIT')
 );
 
 -- Idempotency tracking table
@@ -250,12 +252,62 @@ AFTER INSERT OR UPDATE ON ledger_entries
 DEFERRABLE INITIALLY DEFERRED
 FOR EACH ROW
 EXECUTE FUNCTION check_ledger_pair_integrity();
+
+-- Database-level constraint trigger on transfers enforcing that no transfer can be committed as PROCESSED
+-- without an exact, balanced double-entry pair existing in ledger_entries.
+CREATE OR REPLACE FUNCTION check_transfer_processed_ledger_pair()
+RETURNS TRIGGER AS $$
+DECLARE
+    debit_count INT;
+    credit_count INT;
+    debit_sum BIGINT;
+    credit_sum BIGINT;
+BEGIN
+    IF NEW.status = 'PROCESSED' THEN
+        SELECT COUNT(*), COALESCE(SUM(amount), 0) INTO debit_count, debit_sum
+        FROM ledger_entries
+        WHERE transfer_id = NEW.id AND type = 'DEBIT' AND wallet_id = NEW.from_wallet_id;
+
+        SELECT COUNT(*), COALESCE(SUM(amount), 0) INTO credit_count, credit_sum
+        FROM ledger_entries
+        WHERE transfer_id = NEW.id AND type = 'CREDIT' AND wallet_id = NEW.to_wallet_id;
+
+        IF debit_count <> 1 OR credit_count <> 1 OR debit_sum <> NEW.amount OR credit_sum <> NEW.amount THEN
+            RAISE EXCEPTION 'cannot commit PROCESSED transfer %: requires exactly 1 DEBIT on from_wallet (%) and 1 CREDIT on to_wallet (%) matching transfer amount (%)',
+                NEW.id, NEW.from_wallet_id, NEW.to_wallet_id, NEW.amount;
+        END IF;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE CONSTRAINT TRIGGER trg_check_transfer_processed
+AFTER INSERT OR UPDATE ON transfers
+DEFERRABLE INITIALLY DEFERRED
+FOR EACH ROW
+EXECUTE FUNCTION check_transfer_processed_ledger_pair();
+
+-- Immutability trigger on ledger_entries: prevent updates and deletes to protect the audit trail
+CREATE OR REPLACE FUNCTION prevent_ledger_mutation()
+RETURNS TRIGGER AS $$
+BEGIN
+    RAISE EXCEPTION 'ledger entries are immutable: deletions and updates are forbidden';
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_prevent_ledger_mutation
+BEFORE DELETE OR UPDATE ON ledger_entries
+FOR EACH ROW
+EXECUTE FUNCTION prevent_ledger_mutation();
 ```
 
 > **Note on Double-Entry Ledger Enforcement Boundaries**:
-> Ledger integrity is protected at two complementary boundaries:
-> 1. **Application & Transaction Boundary**: The service and repository layers strictly create ledger entries in balanced atomic pairs via `domain.NewDoubleEntryPair(transferID, fromID, toID, amount)` and `repos.Ledger.CreateLedgerEntries(ctx, debit, credit)` within the transfer transaction.
-> 2. **Database Constraint Trigger Boundary**: PostgreSQL constraint trigger `trg_check_ledger_pair` (deferred to transaction commit) independently validates at the database level that every transfer has exactly one DEBIT on `from_wallet_id` and one CREDIT on `to_wallet_id` with matching sums, rejecting any unbalanced or reversed inserts.
+> Ledger integrity is protected at complementary boundaries:
+> 1. **Application & Transaction Boundary**: The service and repository layers strictly create ledger entries in balanced atomic pairs via `domain.NewDoubleEntryPair(transferID, fromID, toID, amount)` and `repos.Ledger.CreateLedgerEntries(ctx, debit, credit)` within the transfer transaction. Multi-row atomic SQL inserts guarantee statement-level atomicity even when invoked against connection pools.
+> 2. **Database Constraint Trigger Boundary**: PostgreSQL constraint triggers validate ledger integrity at transaction commit:
+>    - `trg_check_ledger_pair` (on `ledger_entries`, deferred): Validates that any transfer referenced in `ledger_entries` has exactly one DEBIT on `from_wallet_id` and one CREDIT on `to_wallet_id` with matching sums.
+>    - `trg_check_transfer_processed` (on `transfers`, deferred): Validates that no transfer can commit with status `PROCESSED` without exactly one DEBIT on `from_wallet_id` and one CREDIT on `to_wallet_id` matching `amount`.
+>    - `trg_prevent_ledger_mutation` (on `ledger_entries`): Guarantees absolute append-only immutability by forbidding any `UPDATE` or `DELETE` on ledger entries.
 
 > **Note on Money Representation**: All monetary values are represented as `BIGINT` representing minor currency units (e.g. cents) to avoid IEEE 754 floating-point rounding errors.
 >
