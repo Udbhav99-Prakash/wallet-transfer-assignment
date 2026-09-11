@@ -94,7 +94,7 @@ To guarantee safe retries across network drops and client retransmissions:
 1. **Idempotency Record Storage**:
    - An `idempotency_records` table tracks every request by `idempotency_key`.
    - Columns include:
-     - `key` (VARCHAR, PRIMARY KEY)
+     - `idempotency_key` (VARCHAR, PRIMARY KEY)
      - `request_hash` (SHA-256 hash of `fromWalletId + toWalletId + amount`)
      - `transfer_id` (UUID/TEXT, NULLABLE)
      - `status` (`IN_PROGRESS`, `COMPLETED`, `FAILED`)
@@ -171,7 +171,7 @@ CREATE TABLE ledger_entries (
 
 -- Idempotency tracking table
 CREATE TABLE idempotency_records (
-    key VARCHAR(128) PRIMARY KEY,
+    idempotency_key VARCHAR(128) PRIMARY KEY,
     request_hash VARCHAR(64) NOT NULL,
     transfer_id VARCHAR(64) REFERENCES transfers(id),
     status VARCHAR(32) NOT NULL CHECK (status IN ('IN_PROGRESS', 'COMPLETED', 'FAILED')),
