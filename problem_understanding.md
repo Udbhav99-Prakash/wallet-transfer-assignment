@@ -95,7 +95,7 @@ To guarantee safe retries across network drops and client retransmissions:
    - An `idempotency_records` table tracks every request by `idempotency_key`.
    - Columns include:
      - `idempotency_key` (VARCHAR, PRIMARY KEY)
-     - `request_hash` (SHA-256 hash of `fromWalletId + toWalletId + amount`)
+     - `request_hash` (SHA-256 hash of a canonical serialization of `fromWalletId`, `toWalletId`, and `amount` (e.g., canonical JSON) to avoid ambiguous concatenation)
      - `transfer_id` (UUID/TEXT, NULLABLE)
      - `status` (`IN_PROGRESS`, `COMPLETED`, `FAILED`)
      - `response_code` (INT)
@@ -189,7 +189,8 @@ CREATE INDEX idx_ledger_transfer ON ledger_entries(transfer_id);
 ```
 
 > **Note on Money Representation**: All monetary values are represented as `BIGINT` representing minor units (e.g. cents) to avoid IEEE 754 floating-point rounding errors.
-
+>
+> **Note on `updated_at`**: `DEFAULT CURRENT_TIMESTAMP` only sets the initial value; updates require application code (or a trigger) to refresh `updated_at`.
 ---
 
 ## 5. Clean Layered Architecture
@@ -303,8 +304,7 @@ wallet-transfer-assignment/
 
 ## 7. Testing Discipline & Verification Strategy
 
-Following the Red-Blue-Green development discipline and comprehensive testing requirements:
-
+Following the Red-Green-Refactor (TDD) development discipline and comprehensive testing requirements:
 1. **Unit Testing**:
    - Domain entity validation (transfer rules, amount validations, state machine transitions).
    - Mock-based service testing for error branches and boundary conditions.
