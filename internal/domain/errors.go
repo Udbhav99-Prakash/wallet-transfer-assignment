@@ -23,4 +23,28 @@ var (
 
 	// ErrInvalidStateTransition is returned when an illegal transfer state transition is attempted.
 	ErrInvalidStateTransition = errors.New("invalid transfer state transition")
+
+	// ErrMissingIdempotencyKey is returned when the idempotency key is empty.
+	ErrMissingIdempotencyKey = errors.New("idempotency key is required")
+
+	// ErrMissingWalletID is returned when the source or destination wallet ID is empty.
+	ErrMissingWalletID = errors.New("source and destination wallet IDs are required")
+
+	// ErrWalletNameRequired is returned when the wallet name is empty.
+	ErrWalletNameRequired = errors.New("wallet name is required")
+
+	// ErrNegativeBalance is returned when a negative initial balance is provided.
+	ErrNegativeBalance = errors.New("initial balance cannot be negative")
+
+	// ErrBalanceOverflow is returned when crediting an amount would overflow the maximum wallet balance.
+	ErrBalanceOverflow = errors.New("balance overflow: maximum wallet balance exceeded")
+
+	// ErrCurrencyMismatch is returned when source and destination wallets have different currencies.
+	ErrCurrencyMismatch = errors.New("source and destination wallets have different currencies")
+
+	// ErrTransferNotFound is returned when a requested transfer does not exist.
+	ErrTransferNotFound = errors.New("transfer not found")
+
+	// ErrWalletAlreadyExists is returned when attempting to create a wallet with an existing ID.
+	ErrWalletAlreadyExists = errors.New("wallet already exists")
 )

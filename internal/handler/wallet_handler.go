@@ -3,6 +3,7 @@ package handler
 import (
 	"encoding/json"
 	"errors"
+	"log"
 	"net/http"
 
 	"wallet-transfer-assignment/internal/domain"
@@ -27,8 +28,22 @@ func (h *WalletHandler) CreateWallet(w http.ResponseWriter, r *http.Request) {
 
 	wallet, err := h.walletService.CreateWallet(r.Context(), req)
 	if err != nil {
-		WriteError(w, http.StatusBadRequest, err.Error())
-		return
+		switch {
+		case errors.Is(err, domain.ErrWalletNameRequired),
+			errors.Is(err, domain.ErrNegativeBalance),
+			errors.Is(err, domain.ErrCurrencyMismatch):
+			WriteError(w, http.StatusBadRequest, err.Error())
+			return
+
+		case errors.Is(err, domain.ErrWalletAlreadyExists):
+			WriteError(w, http.StatusConflict, err.Error())
+			return
+
+		default:
+			log.Printf("[ERROR] failed to create wallet: %v", err)
+			WriteError(w, http.StatusInternalServerError, "internal server error")
+			return
+		}
 	}
 
 	WriteJSON(w, http.StatusCreated, wallet)
@@ -48,7 +63,8 @@ func (h *WalletHandler) GetWallet(w http.ResponseWriter, r *http.Request) {
 			WriteError(w, http.StatusNotFound, "wallet not found")
 			return
 		}
-		WriteError(w, http.StatusInternalServerError, err.Error())
+		log.Printf("[ERROR] failed to get wallet %s: %v", wallet_id, err)
+		WriteError(w, http.StatusInternalServerError, "internal server error")
 		return
 	}
 
@@ -69,7 +85,8 @@ func (h *WalletHandler) GetWalletLedger(w http.ResponseWriter, r *http.Request) 
 			WriteError(w, http.StatusNotFound, "wallet not found")
 			return
 		}
-		WriteError(w, http.StatusInternalServerError, err.Error())
+		log.Printf("[ERROR] failed to get ledger for wallet %s: %v", wallet_id, err)
+		WriteError(w, http.StatusInternalServerError, "internal server error")
 		return
 	}
 
@@ -90,7 +107,8 @@ func (h *WalletHandler) ReconcileWallet(w http.ResponseWriter, r *http.Request) 
 			WriteError(w, http.StatusNotFound, "wallet not found")
 			return
 		}
-		WriteError(w, http.StatusInternalServerError, err.Error())
+		log.Printf("[ERROR] failed to reconcile balance for wallet %s: %v", wallet_id, err)
+		WriteError(w, http.StatusInternalServerError, "internal server error")
 		return
 	}
 

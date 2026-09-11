@@ -39,10 +39,10 @@ type Transfer struct {
 // Validate ensures transfer inputs satisfy business invariants.
 func (t *Transfer) Validate() error {
 	if t.IdempotencyKey == "" {
-		return ErrInvalidAmount
+		return ErrMissingIdempotencyKey
 	}
 	if t.FromWalletID == "" || t.ToWalletID == "" {
-		return ErrWalletNotFound
+		return ErrMissingWalletID
 	}
 	if t.FromWalletID == t.ToWalletID {
 		return ErrSameWalletTransfer

@@ -1,6 +1,7 @@
 package domain_test
 
 import (
+	"math"
 	"testing"
 
 	"wallet-transfer-assignment/internal/domain"
@@ -36,6 +37,40 @@ func TestWallet_DebitAndCredit(t *testing.T) {
 	}
 	if w.Balance != 110 {
 		t.Fatalf("expected balance 110, got %d", w.Balance)
+	}
+
+	// Test negative credit amount
+	if err := w.Credit(-10); err != domain.ErrInvalidAmount {
+		t.Fatalf("expected ErrInvalidAmount, got %v", err)
+	}
+	if err := w.Credit(0); err != domain.ErrInvalidAmount {
+		t.Fatalf("expected ErrInvalidAmount for 0, got %v", err)
+	}
+
+	// Test CanCredit and Credit overflow
+	w.Balance = math.MaxInt64 - 50
+	if !w.CanCredit(50) {
+		t.Fatalf("expected CanCredit(50) to be true")
+	}
+	if w.CanCredit(51) {
+		t.Fatalf("expected CanCredit(51) to be false due to overflow")
+	}
+	if w.CanCredit(0) {
+		t.Fatalf("expected CanCredit(0) to be false")
+	}
+	if w.CanCredit(-10) {
+		t.Fatalf("expected CanCredit(-10) to be false")
+	}
+
+	if err := w.Credit(50); err != nil {
+		t.Fatalf("unexpected error crediting up to MaxInt64: %v", err)
+	}
+	if w.Balance != math.MaxInt64 {
+		t.Fatalf("expected balance to be math.MaxInt64, got %d", w.Balance)
+	}
+
+	if err := w.Credit(1); err != domain.ErrBalanceOverflow {
+		t.Fatalf("expected ErrBalanceOverflow, got %v", err)
 	}
 }
 
@@ -86,6 +121,27 @@ func TestTransfer_ValidationErrors(t *testing.T) {
 	if err := tr.Validate(); err != domain.ErrInvalidAmount {
 		t.Fatalf("expected ErrInvalidAmount, got %v", err)
 	}
+
+	// Missing idempotency key
+	tr.Amount = 100
+	tr.IdempotencyKey = ""
+	if err := tr.Validate(); err != domain.ErrMissingIdempotencyKey {
+		t.Fatalf("expected ErrMissingIdempotencyKey, got %v", err)
+	}
+
+	// Missing from_wallet_id
+	tr.IdempotencyKey = "k1"
+	tr.FromWalletID = ""
+	if err := tr.Validate(); err != domain.ErrMissingWalletID {
+		t.Fatalf("expected ErrMissingWalletID, got %v", err)
+	}
+
+	// Missing to_wallet_id
+	tr.FromWalletID = "w1"
+	tr.ToWalletID = ""
+	if err := tr.Validate(); err != domain.ErrMissingWalletID {
+		t.Fatalf("expected ErrMissingWalletID, got %v", err)
+	}
 }
 
 func TestLedger_NewDoubleEntryPair(t *testing.T) {
@@ -112,5 +168,13 @@ func TestIdempotency_ComputeRequestHash(t *testing.T) {
 	}
 	if h1 == h3 {
 		t.Fatalf("expected different hashes for different amounts")
+	}
+
+	// Verify length-delimited encoding prevents delimiter-injection collisions:
+	// (from="a", to="b:c") vs (from="a:b", to="c")
+	hCol1 := domain.ComputeRequestHash("a", "b:c", 100)
+	hCol2 := domain.ComputeRequestHash("a:b", "c", 100)
+	if hCol1 == hCol2 {
+		t.Fatalf("expected different hashes for delimiter-containing inputs")
 	}
 }

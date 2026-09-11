@@ -60,7 +60,7 @@ If User 1 transfers from Wallet A to Wallet B while User 2 transfers from Wallet
 
 #### The Solution: Deterministic Row Lock Ordering
 To eliminate both race conditions and deadlocks:
-1. **Pessimistic Row-Level Locking**: Acquire row locks on both wallets using `SELECT ... FOR UPDATE` (or atomic updates within a serializable/immediate transaction).
+1. **Pessimistic Row-Level Locking**: Acquire row locks on both wallets using `SELECT ... FOR UPDATE` within a `READ COMMITTED` PostgreSQL transaction. This guarantees that modifications to the same wallets are serialized, preventing lost updates and race conditions without relying on optimistic retry loops.
 2. **Deterministic Lock Ordering**: Always acquire locks on `min(fromWalletId, toWalletId)` first, followed by `max(fromWalletId, toWalletId)`.
    - Even if transfers occur in opposite directions ($A \to B$ and $B \to A$), both transactions lock in the identical order ($\min(A, B)$ then $\max(A, B)$).
    - By eliminating circular wait conditions (Coffman conditions), deadlocks become mathematically impossible.
@@ -95,24 +95,42 @@ To guarantee safe retries across network drops and client retransmissions:
    - An `idempotency_records` table tracks every request by `idempotency_key`.
    - Columns include:
      - `idempotency_key` (VARCHAR, PRIMARY KEY)
-     - `request_hash` (SHA-256 hash of a canonical serialization of `fromWalletId`, `toWalletId`, and `amount` (e.g., canonical JSON) to avoid ambiguous concatenation)
+     - `request_hash` (SHA-256 digest of the canonical length-delimited representation: `len(from) + ":" + from + ":" + len(to) + ":" + to + ":" + amount`, eliminating delimiter-injection collisions such as `("a", "b:c")` vs `("a:b", "c")`)
      - `transfer_id` (UUID/TEXT, NULLABLE)
      - `status` (`IN_PROGRESS`, `COMPLETED`, `FAILED`)
      - `response_code` (INT)
      - `response_body` (TEXT)
      - `created_at`, `updated_at`
 
-2. **Handling Scenarios**:
-   - **First Arrival (New Key)**:
-     - Insert idempotency record with status `IN_PROGRESS`.
-     - Execute the transfer inside the transaction.
-     - On success: update record with status `COMPLETED`, HTTP status `200/201`, and serialized response body.
-     - On business failure (e.g. insufficient funds): update record with status `FAILED`, HTTP status `422/400`, and error response body.
+2. **Handling Scenarios & Short Committed Reservation Protocol**:
+   - **Why Reservations Cannot Be Inside the Transfer Transaction**:
+     - In PostgreSQL, if an `IN_PROGRESS` reservation is inserted inside the same transaction as the transfer, concurrent duplicate requests executing `INSERT ... ON CONFLICT` block on the unique-index tuple until the first transaction commits or rolls back.
+     - When the first transaction commits, concurrent requests wake up and observe `COMPLETED`, completely bypassing the documented `IN_PROGRESS` / `409 Conflict` behavior and holding connection pool connections for the full transfer duration.
+   - **The Short Committed Reservation Architecture**:
+     1. **Key Validation & Resolution Precedence**:
+        - Validate `idempotency_key` is not empty (returns `400 Bad Request` if missing).
+        - Compute canonical `request_hash`.
+        - Resolve the existing key against the fingerprint **before** running business-field validation. Reusing an existing key with altered parameters (even if invalid, e.g. `amount <= 0` or missing wallet) returns `409 Conflict` (`ErrIdempotencyConflict`), ensuring that idempotency conflict detection takes precedence over body validation.
+     2. **Short Committed Reservation**:
+        - Execute a standalone atomic `INSERT INTO idempotency_records ... ON CONFLICT DO NOTHING` committed immediately *outside* the transfer transaction.
+        - Overlapping concurrent requests immediately observe the committed `IN_PROGRESS` status and return `409 Conflict` (`ErrIdempotencyInProgress`) without waiting or exhausting pool connections.
+     3. **Atomic Stale-Owner Recovery**:
+        - If an `IN_PROGRESS` record's `updated_at` is older than `stale_timeout` (e.g. 30 seconds, indicating a crashed node or abandoned request), a new request atomically reclaims ownership via compare-and-swap:
+          ```sql
+          UPDATE idempotency_records
+          SET request_hash = $1, status = 'IN_PROGRESS', updated_at = $2
+          WHERE idempotency_key = $3 AND status = 'IN_PROGRESS' AND updated_at <= $4
+          RETURNING idempotency_key;
+          ```
+     4. **Deferred Cleanup on Unexpected Abort**:
+        - If execution fails unexpectedly before reaching a terminal state (`COMPLETED` or `FAILED`), a deferred hook calls `DELETE FROM idempotency_records WHERE idempotency_key = $1 AND status = 'IN_PROGRESS'`, freeing the key for immediate retry.
+     5. **Atomic Finalization**:
+        - The transfer transaction updates the idempotency record to `COMPLETED` (HTTP 200/201) or `FAILED` (HTTP 422) atomically with wallet balances and ledger entries.
    - **Duplicate Arrival (Existing Key, Identical Payload)**:
-     - If record status is `COMPLETED` or `FAILED`: immediately return the cached `response_code` and `response_body`. Zero side effects triggered.
-     - If record status is `IN_PROGRESS`: another request with the same key is currently running. Return `409 Conflict` (or `425 Too Early` / retry after backoff) to prevent concurrent duplicate execution.
+     - If record status is `COMPLETED` or `FAILED`: immediately return the cached `response_code` and `response_body` with `is_replay: true`. Zero side effects triggered.
+     - If record status is `IN_PROGRESS`: another request with the same key is currently running. Return `409 Conflict` (`ErrIdempotencyInProgress`) immediately.
    - **Key Collision (Existing Key, Different Payload)**:
-     - If `request_hash` does not match the stored hash: return `409 Conflict` with an error message: `"Idempotency key reused with different request payload"`.
+     - If `request_hash` does not match the stored hash: return `409 Conflict` (`ErrIdempotencyConflict`) with message: `"idempotency key reused with different request payload"`.
 
 ---
 
@@ -188,9 +206,11 @@ CREATE INDEX idx_ledger_wallet ON ledger_entries(wallet_id);
 CREATE INDEX idx_ledger_transfer ON ledger_entries(transfer_id);
 ```
 
-> **Note on Money Representation**: All monetary values are represented as `BIGINT` representing minor units (e.g. cents) to avoid IEEE 754 floating-point rounding errors.
+> **Note on Money Representation**: All monetary values are represented as `BIGINT` representing minor currency units (e.g. cents) to avoid IEEE 754 floating-point rounding errors.
 >
-> **Note on `updated_at`**: `DEFAULT CURRENT_TIMESTAMP` only sets the initial value; updates require application code (or a trigger) to refresh `updated_at`.
+> **Note on Schema Naming & Consistency**: Table names (`wallets`, `transfers`, `ledger_entries`, `idempotency_records`) and foreign keys strictly align across DDL, domain models, and repositories. The primary key of `idempotency_records` is explicitly `idempotency_key` (avoiding reserved SQL keywords). In `ledger_entries`, `id` represents the unique entry identifier (`entry_id`).
+>
+> **Note on `updated_at` Semantics**: In PostgreSQL, `DEFAULT CURRENT_TIMESTAMP` sets the initial timestamp on `INSERT`, but PostgreSQL does not automatically update this column upon `UPDATE` statements without a trigger. To maintain explicit, auditable control and avoid database trigger side effects, the application layer explicitly updates `updated_at = time.Now().UTC()` in all `UPDATE` queries across repositories. Note that `ledger_entries` is append-only/immutable by accounting design, and therefore intentionally contains only `created_at` with no `updated_at`.
 ---
 
 ## 5. Clean Layered Architecture

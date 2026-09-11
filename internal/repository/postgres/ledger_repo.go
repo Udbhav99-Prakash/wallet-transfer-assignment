@@ -38,9 +38,13 @@ func (r *ledgerRepository) CreateLedgerEntries(ctx context.Context, entries ...d
 		if now.IsZero() {
 			now = time.Now().UTC()
 		}
+		var transferID *string
+		if entry.TransferID != "" {
+			transferID = &entry.TransferID
+		}
 		_, err := r.db.Exec(ctx, query,
 			id,
-			entry.TransferID,
+			transferID,
 			entry.WalletID,
 			string(entry.Type),
 			entry.Amount,
@@ -55,7 +59,7 @@ func (r *ledgerRepository) CreateLedgerEntries(ctx context.Context, entries ...d
 
 func (r *ledgerRepository) GetLedgerByWalletID(ctx context.Context, walletID string) ([]domain.LedgerEntry, error) {
 	query := `
-		SELECT id, transfer_id, wallet_id, type, amount, created_at
+		SELECT id, COALESCE(transfer_id, ''), wallet_id, type, amount, created_at
 		FROM ledger_entries
 		WHERE wallet_id = $1
 		ORDER BY created_at ASC

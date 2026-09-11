@@ -3,8 +3,9 @@ package service
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
+	"net/http"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -14,40 +15,40 @@ import (
 
 // TransferService provides transactional wallet transfer operations.
 type TransferService struct {
-	txManager repository.TxManager
-	repos     repository.Repositories
+	txManager    repository.TxManager
+	repos        repository.Repositories
+	staleTimeout time.Duration
 }
 
 // NewTransferService constructs a TransferService.
 func NewTransferService(txManager repository.TxManager, repos repository.Repositories) *TransferService {
 	return &TransferService{
-		txManager: txManager,
-		repos:     repos,
+		txManager:    txManager,
+		repos:        repos,
+		staleTimeout: 30 * time.Second,
 	}
+}
+
+// SetStaleTimeout overrides the default stale reservation timeout (useful for testing).
+func (s *TransferService) SetStaleTimeout(d time.Duration) {
+	s.staleTimeout = d
 }
 
 // ExecuteTransfer orchestrates a safe, idempotent, double-entry wallet transfer.
 func (s *TransferService) ExecuteTransfer(ctx context.Context, req CreateTransferRequest) (*TransferResponse, error) {
-	// 1. Basic validation
+	// 1. Validate the idempotency key itself first
 	if req.IdempotencyKey == "" {
-		return nil, errors.New("idempotencyKey is required")
-	}
-	if req.FromWalletID == "" || req.ToWalletID == "" {
-		return nil, domain.ErrWalletNotFound
-	}
-	if req.FromWalletID == req.ToWalletID {
-		return nil, domain.ErrSameWalletTransfer
-	}
-	if req.Amount <= 0 {
-		return nil, domain.ErrInvalidAmount
+		return nil, domain.ErrMissingIdempotencyKey
 	}
 
 	requestHash := domain.ComputeRequestHash(req.FromWalletID, req.ToWalletID, req.Amount)
 
-	// 2. Pre-check existing idempotency record outside transaction for fast replay
+	// 2. Resolve existing idempotency key against canonical request fingerprint before business-field validation.
+	// This ensures that reusing an existing key with changed but invalid parameters (e.g. negative amount,
+	// missing wallet ID, or identical source/destination) returns 409 Conflict instead of 400/404.
 	existing, err := s.repos.Idempotency.GetIdempotency(ctx, req.IdempotencyKey)
 	if err != nil {
-		return nil, fmt.Errorf("error checking idempotency: %w", err)
+		return nil, fmt.Errorf("error resolving idempotency record: %w", err)
 	}
 	if existing != nil {
 		if existing.RequestHash != requestHash {
@@ -57,6 +58,7 @@ func (s *TransferService) ExecuteTransfer(ctx context.Context, req CreateTransfe
 			var cachedResp TransferResponse
 			if jsonErr := json.Unmarshal([]byte(existing.ResponseBody), &cachedResp); jsonErr == nil {
 				cachedResp.IsReplay = true
+				cachedResp.ResponseCode = existing.ResponseCode
 				if existing.Status == domain.IdempotencyStatusFailed {
 					return &cachedResp, domain.ErrInsufficientFunds
 				}
@@ -64,42 +66,87 @@ func (s *TransferService) ExecuteTransfer(ctx context.Context, req CreateTransfe
 			}
 		}
 		if existing.Status == domain.IdempotencyStatusInProgress {
-			return nil, domain.ErrIdempotencyInProgress
+			staleTimeout := s.staleTimeout
+			if staleTimeout <= 0 {
+				staleTimeout = 30 * time.Second
+			}
+			if time.Since(existing.UpdatedAt) <= staleTimeout {
+				return nil, domain.ErrIdempotencyInProgress
+			}
+			// If stale, fall through to business validation and atomic reclaim in ReserveIdempotency.
 		}
 	}
+
+	// 3. Business-field validation (for new keys or stale lock reclaims)
+	if req.FromWalletID == "" || req.ToWalletID == "" {
+		return nil, domain.ErrMissingWalletID
+	}
+	if req.FromWalletID == req.ToWalletID {
+		return nil, domain.ErrSameWalletTransfer
+	}
+	if req.Amount <= 0 {
+		return nil, domain.ErrInvalidAmount
+	}
+
+	// 4. Short committed reservation outside the transfer transaction.
+	// This immediately inserts and commits an IN_PROGRESS reservation.
+	// Overlapping concurrent requests immediately see IN_PROGRESS and return 409 Conflict,
+	// without blocking on an uncommitted row or starving pool connections for the duration of the transfer.
+	staleTimeout := s.staleTimeout
+	if staleTimeout <= 0 {
+		staleTimeout = 30 * time.Second
+	}
+
+	record := &domain.IdempotencyRecord{
+		IdempotencyKey: req.IdempotencyKey,
+		RequestHash:    requestHash,
+		Status:         domain.IdempotencyStatusInProgress,
+	}
+
+	reservedRecord, isOwner, err := s.repos.Idempotency.ReserveIdempotency(ctx, record, staleTimeout)
+	if err != nil {
+		return nil, fmt.Errorf("error reserving idempotency record: %w", err)
+	}
+
+	if !isOwner {
+		// Key already exists (or another process is currently executing)
+		if reservedRecord.RequestHash != requestHash {
+			return nil, domain.ErrIdempotencyConflict
+		}
+		if reservedRecord.Status == domain.IdempotencyStatusCompleted || reservedRecord.Status == domain.IdempotencyStatusFailed {
+			var cachedResp TransferResponse
+			if jsonErr := json.Unmarshal([]byte(reservedRecord.ResponseBody), &cachedResp); jsonErr == nil {
+				cachedResp.IsReplay = true
+				cachedResp.ResponseCode = reservedRecord.ResponseCode
+				if reservedRecord.Status == domain.IdempotencyStatusFailed {
+					return &cachedResp, domain.ErrInsufficientFunds
+				}
+				return &cachedResp, nil
+			}
+		}
+		if reservedRecord.Status == domain.IdempotencyStatusInProgress {
+			return nil, domain.ErrIdempotencyInProgress
+		}
+		return nil, domain.ErrIdempotencyConflict
+	}
+
+	// The caller owns the reservation.
+	// If the transfer execution fails unexpectedly (e.g. context cancellation, DB connection drop),
+	// delete the in-progress reservation so subsequent retries do not have to wait for stale timeout.
+	success := false
+	defer func() {
+		if !success {
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			_ = s.repos.Idempotency.DeleteIdempotency(cleanupCtx, req.IdempotencyKey)
+		}
+	}()
 
 	// 3. Execute transfer inside transaction
 	var finalResponse *TransferResponse
 	var isInsufficientFunds bool
 
 	txErr := s.txManager.ExecuteInTx(ctx, func(txRepos repository.Repositories) error {
-		// Reserve idempotency key inside transaction
-		record := &domain.IdempotencyRecord{
-			IdempotencyKey: req.IdempotencyKey,
-			RequestHash:    requestHash,
-			Status:         domain.IdempotencyStatusInProgress,
-		}
-		reservedRecord, isNew, reserveErr := txRepos.Idempotency.ReserveIdempotency(ctx, record)
-		if reserveErr != nil {
-			return reserveErr
-		}
-		if !isNew {
-			if reservedRecord.RequestHash != requestHash {
-				return domain.ErrIdempotencyConflict
-			}
-			if reservedRecord.Status == domain.IdempotencyStatusCompleted || reservedRecord.Status == domain.IdempotencyStatusFailed {
-				var cachedResp TransferResponse
-				if jsonErr := json.Unmarshal([]byte(reservedRecord.ResponseBody), &cachedResp); jsonErr == nil {
-					cachedResp.IsReplay = true
-					finalResponse = &cachedResp
-					if reservedRecord.Status == domain.IdempotencyStatusFailed {
-						isInsufficientFunds = true
-					}
-					return nil
-				}
-			}
-			return domain.ErrIdempotencyInProgress
-		}
 
 		// Deterministic lock ordering to prevent deadlocks:
 		// Always acquire locks in alphabetical order: min(fromID, toID) followed by max(fromID, toID)
@@ -124,6 +171,11 @@ func (s *TransferService) ExecuteTransfer(ctx context.Context, req CreateTransfe
 			fromWallet, toWallet = wallet2, wallet1
 		}
 
+		// Reject transfers between wallets with mismatched currencies
+		if fromWallet.Currency != toWallet.Currency {
+			return domain.ErrCurrencyMismatch
+		}
+
 		// Initialize transfer record with PENDING state
 		transferID := uuid.NewString()
 		transfer := &domain.Transfer{
@@ -141,8 +193,12 @@ func (s *TransferService) ExecuteTransfer(ctx context.Context, req CreateTransfe
 		// Check balance for debit
 		if !fromWallet.CanDebit(req.Amount) {
 			reason := "insufficient funds in source wallet"
-			_ = transfer.MarkFailed(reason)
-			_ = txRepos.Transfers.UpdateTransferStatus(ctx, transfer.ID, domain.TransferStatusFailed, &reason)
+			if markErr := transfer.MarkFailed(reason); markErr != nil {
+				return markErr
+			}
+			if updateErr := txRepos.Transfers.UpdateTransferStatus(ctx, transfer.ID, domain.TransferStatusFailed, &reason); updateErr != nil {
+				return updateErr
+			}
 
 			resp := &TransferResponse{
 				TransferID:     transfer.ID,
@@ -153,17 +209,24 @@ func (s *TransferService) ExecuteTransfer(ctx context.Context, req CreateTransfe
 				Status:         domain.TransferStatusFailed,
 				FailureReason:  &reason,
 				CreatedAt:      transfer.CreatedAt,
+				ResponseCode:   http.StatusUnprocessableEntity,
 			}
-			respBytes, _ := json.Marshal(resp)
+			respBytes, jsonErr := json.Marshal(resp)
+			if jsonErr != nil {
+				return fmt.Errorf("failed to marshal failure response: %w", jsonErr)
+			}
 
 			record.Status = domain.IdempotencyStatusFailed
 			record.TransferID = &transfer.ID
-			record.ResponseCode = 422
+			record.ResponseCode = http.StatusUnprocessableEntity
 			record.ResponseBody = string(respBytes)
-			_ = txRepos.Idempotency.UpdateIdempotency(ctx, record)
+			if updateErr := txRepos.Idempotency.UpdateIdempotency(ctx, record); updateErr != nil {
+				return updateErr
+			}
 
 			finalResponse = resp
 			isInsufficientFunds = true
+			success = true
 			// Return nil so the transaction commits the FAILED transfer record and idempotency record
 			return nil
 		}
@@ -209,18 +272,23 @@ func (s *TransferService) ExecuteTransfer(ctx context.Context, req CreateTransfe
 			Amount:         transfer.Amount,
 			Status:         domain.TransferStatusProcessed,
 			CreatedAt:      transfer.CreatedAt,
+			ResponseCode:   http.StatusCreated,
 		}
-		respBytes, _ := json.Marshal(resp)
+		respBytes, jsonErr := json.Marshal(resp)
+		if jsonErr != nil {
+			return fmt.Errorf("failed to marshal success response: %w", jsonErr)
+		}
 
 		record.Status = domain.IdempotencyStatusCompleted
 		record.TransferID = &transfer.ID
-		record.ResponseCode = 200
+		record.ResponseCode = http.StatusCreated
 		record.ResponseBody = string(respBytes)
 		if updateErr := txRepos.Idempotency.UpdateIdempotency(ctx, record); updateErr != nil {
 			return updateErr
 		}
 
 		finalResponse = resp
+		success = true
 		return nil
 	})
 

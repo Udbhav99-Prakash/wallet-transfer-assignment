@@ -42,6 +42,10 @@ func (r *walletRepository) CreateWallet(ctx context.Context, wallet *domain.Wall
 		wallet.UpdatedAt,
 	)
 	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+			return fmt.Errorf("%w: %s", domain.ErrWalletAlreadyExists, wallet.ID)
+		}
 		return fmt.Errorf("failed to create wallet: %w", err)
 	}
 	return nil

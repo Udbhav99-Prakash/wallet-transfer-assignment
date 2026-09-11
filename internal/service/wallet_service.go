@@ -2,7 +2,6 @@ package service
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"time"
 
@@ -14,21 +13,22 @@ import (
 
 // WalletService provides wallet inspection, creation, and ledger balance reconciliation.
 type WalletService struct {
-	repos repository.Repositories
+	txManager repository.TxManager
+	repos     repository.Repositories
 }
 
 // NewWalletService constructs a WalletService.
-func NewWalletService(repos repository.Repositories) *WalletService {
-	return &WalletService{repos: repos}
+func NewWalletService(txManager repository.TxManager, repos repository.Repositories) *WalletService {
+	return &WalletService{txManager: txManager, repos: repos}
 }
 
 // CreateWallet creates a new wallet with an initial balance and initial credit ledger record if balance > 0.
 func (s *WalletService) CreateWallet(ctx context.Context, req CreateWalletRequest) (*domain.Wallet, error) {
 	if req.Name == "" {
-		return nil, errors.New("wallet name is required")
+		return nil, domain.ErrWalletNameRequired
 	}
 	if req.InitialBalance < 0 {
-		return nil, errors.New("initial balance cannot be negative")
+		return nil, domain.ErrNegativeBalance
 	}
 
 	walletID := req.ID
@@ -51,30 +51,58 @@ func (s *WalletService) CreateWallet(ctx context.Context, req CreateWalletReques
 		UpdatedAt: now,
 	}
 
-	if err := s.repos.Wallets.CreateWallet(ctx, wallet); err != nil {
-		return nil, fmt.Errorf("failed to create wallet: %w", err)
+	createOp := func(repos repository.Repositories) error {
+		if err := repos.Wallets.CreateWallet(ctx, wallet); err != nil {
+			return fmt.Errorf("failed to create wallet: %w", err)
+		}
+
+		// If seeded with an initial balance, record an initial funding transfer, double-entry ledger pair,
+		// and debit system_treasury so both wallets remain fully reconciled with their ledger entries.
+		if req.InitialBalance > 0 {
+			treasury, err := repos.Wallets.GetWalletByIDForUpdate(ctx, "system_treasury")
+			if err != nil {
+				return fmt.Errorf("failed to fetch system treasury wallet: %w", err)
+			}
+			if treasury.Currency != wallet.Currency {
+				return fmt.Errorf("initial funding from system treasury (%s) to wallet (%s) not supported: %w", treasury.Currency, wallet.Currency, domain.ErrCurrencyMismatch)
+			}
+			if err := treasury.Debit(req.InitialBalance); err != nil {
+				return fmt.Errorf("failed to debit system treasury: %w", err)
+			}
+			if err := repos.Wallets.UpdateWalletBalance(ctx, treasury.ID, treasury.Balance); err != nil {
+				return fmt.Errorf("failed to update system treasury balance: %w", err)
+			}
+
+			transferID := uuid.NewString()
+			depositTransfer := &domain.Transfer{
+				ID:             transferID,
+				IdempotencyKey: fmt.Sprintf("deposit-%s", wallet.ID),
+				FromWalletID:   "system_treasury",
+				ToWalletID:     wallet.ID,
+				Amount:         req.InitialBalance,
+				Status:         domain.TransferStatusProcessed,
+				CreatedAt:      now,
+				UpdatedAt:      now,
+			}
+			if err := repos.Transfers.CreateTransfer(ctx, depositTransfer); err != nil {
+				return fmt.Errorf("failed to create deposit transfer: %w", err)
+			}
+
+			debitTreasury, creditWallet, _ := domain.NewDoubleEntryPair(transferID, "system_treasury", wallet.ID, req.InitialBalance)
+			if err := repos.Ledger.CreateLedgerEntries(ctx, debitTreasury, creditWallet); err != nil {
+				return fmt.Errorf("failed to record initial deposit ledger entries: %w", err)
+			}
+		}
+		return nil
 	}
 
-	// If seeded with an initial balance, record an initial funding transfer and double-entry ledger pair
-	if req.InitialBalance > 0 {
-		transferID := uuid.NewString()
-		depositTransfer := &domain.Transfer{
-			ID:             transferID,
-			IdempotencyKey: fmt.Sprintf("deposit-%s", wallet.ID),
-			FromWalletID:   "system_treasury",
-			ToWalletID:     wallet.ID,
-			Amount:         req.InitialBalance,
-			Status:         domain.TransferStatusProcessed,
-			CreatedAt:      now,
-			UpdatedAt:      now,
+	if s.txManager != nil {
+		if err := s.txManager.ExecuteInTx(ctx, createOp); err != nil {
+			return nil, err
 		}
-		if err := s.repos.Transfers.CreateTransfer(ctx, depositTransfer); err != nil {
-			return nil, fmt.Errorf("failed to create deposit transfer: %w", err)
-		}
-
-		debitTreasury, creditWallet, _ := domain.NewDoubleEntryPair(transferID, "system_treasury", wallet.ID, req.InitialBalance)
-		if err := s.repos.Ledger.CreateLedgerEntries(ctx, debitTreasury, creditWallet); err != nil {
-			return nil, fmt.Errorf("failed to record initial deposit ledger entries: %w", err)
+	} else {
+		if err := createOp(s.repos); err != nil {
+			return nil, err
 		}
 	}
 
@@ -96,17 +124,40 @@ func (s *WalletService) GetWalletLedger(ctx context.Context, walletID string) ([
 }
 
 // ReconcileBalance audits stored balance against the sum of historical ledger entries.
+// Acquires a row lock on the wallet within a transaction so concurrent transfers cannot commit
+// between the stored balance read and the ledger calculation, preventing false reconciliation mismatches.
 func (s *WalletService) ReconcileBalance(ctx context.Context, walletID string) (storedBalance int64, ledgerBalance int64, isBalanced bool, err error) {
-	wallet, err := s.repos.Wallets.GetWalletByID(ctx, walletID)
-	if err != nil {
-		return 0, 0, false, err
+	reconcileOp := func(repos repository.Repositories) error {
+		var wallet *domain.Wallet
+		var getErr error
+		if s.txManager != nil {
+			wallet, getErr = repos.Wallets.GetWalletByIDForUpdate(ctx, walletID)
+		} else {
+			wallet, getErr = repos.Wallets.GetWalletByID(ctx, walletID)
+		}
+		if getErr != nil {
+			return getErr
+		}
+
+		ledgerBal, calcErr := repos.Ledger.CalculateLedgerBalance(ctx, walletID)
+		if calcErr != nil {
+			return calcErr
+		}
+
+		storedBalance = wallet.Balance
+		ledgerBalance = ledgerBal
+		isBalanced = storedBalance == ledgerBalance
+		return nil
 	}
 
-	ledgerBal, err := s.repos.Ledger.CalculateLedgerBalance(ctx, walletID)
-	if err != nil {
-		return 0, 0, false, err
+	if s.txManager != nil {
+		if err := s.txManager.ExecuteInTx(ctx, reconcileOp); err != nil {
+			return 0, 0, false, err
+		}
+	} else {
+		if err := reconcileOp(s.repos); err != nil {
+			return 0, 0, false, err
+		}
 	}
-
-	isBalanced = wallet.Balance == ledgerBal
-	return wallet.Balance, ledgerBal, isBalanced, nil
+	return storedBalance, ledgerBalance, isBalanced, nil
 }

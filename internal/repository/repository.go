@@ -2,6 +2,7 @@ package repository
 
 import (
 	"context"
+	"time"
 
 	"wallet-transfer-assignment/internal/domain"
 )
@@ -32,9 +33,10 @@ type LedgerRepository interface {
 
 // IdempotencyRepository manages idempotency records and response caching.
 type IdempotencyRepository interface {
-	ReserveIdempotency(ctx context.Context, record *domain.IdempotencyRecord) (*domain.IdempotencyRecord, bool, error)
+	ReserveIdempotency(ctx context.Context, record *domain.IdempotencyRecord, staleTimeout time.Duration) (*domain.IdempotencyRecord, bool, error)
 	GetIdempotency(ctx context.Context, key string) (*domain.IdempotencyRecord, error)
 	UpdateIdempotency(ctx context.Context, record *domain.IdempotencyRecord) error
+	DeleteIdempotency(ctx context.Context, key string) error
 }
 
 // Repositories aggregates all repository interfaces.

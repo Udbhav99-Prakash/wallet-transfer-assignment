@@ -3,6 +3,7 @@ package handler
 import (
 	"encoding/json"
 	"errors"
+	"log"
 	"net/http"
 
 	"wallet-transfer-assignment/internal/domain"
@@ -34,18 +35,27 @@ func (h *TransferHandler) CreateTransfer(w http.ResponseWriter, r *http.Request)
 		switch {
 		case errors.Is(err, domain.ErrInsufficientFunds):
 			// Return 422 with the transfer failure details if available
+			statusCode := http.StatusUnprocessableEntity
+			if resp != nil && resp.ResponseCode > 0 {
+				statusCode = resp.ResponseCode
+			}
 			if resp != nil {
-				WriteJSON(w, http.StatusUnprocessableEntity, resp)
+				WriteJSON(w, statusCode, resp)
 				return
 			}
-			WriteError(w, http.StatusUnprocessableEntity, err.Error())
+			WriteError(w, statusCode, err.Error())
 			return
 
 		case errors.Is(err, domain.ErrWalletNotFound):
 			WriteError(w, http.StatusNotFound, err.Error())
 			return
 
-		case errors.Is(err, domain.ErrSameWalletTransfer), errors.Is(err, domain.ErrInvalidAmount):
+		case errors.Is(err, domain.ErrSameWalletTransfer),
+			errors.Is(err, domain.ErrInvalidAmount),
+			errors.Is(err, domain.ErrMissingIdempotencyKey),
+			errors.Is(err, domain.ErrMissingWalletID),
+			errors.Is(err, domain.ErrBalanceOverflow),
+			errors.Is(err, domain.ErrCurrencyMismatch):
 			WriteError(w, http.StatusBadRequest, err.Error())
 			return
 
@@ -58,17 +68,18 @@ func (h *TransferHandler) CreateTransfer(w http.ResponseWriter, r *http.Request)
 			return
 
 		default:
-			WriteError(w, http.StatusInternalServerError, "internal server error: "+err.Error())
+			log.Printf("[ERROR] transfer execution failed: %v", err)
+			WriteError(w, http.StatusInternalServerError, "internal server error")
 			return
 		}
 	}
 
-	// If it's a replayed idempotent request, return 200 OK. If newly processed, return 201 Created.
-	if resp.IsReplay {
-		WriteJSON(w, http.StatusOK, resp)
-		return
+	// Preserve the original status code (e.g. 201 Created) across both initial and replayed requests
+	statusCode := http.StatusCreated
+	if resp.ResponseCode > 0 {
+		statusCode = resp.ResponseCode
 	}
-	WriteJSON(w, http.StatusCreated, resp)
+	WriteJSON(w, statusCode, resp)
 }
 
 // GetTransfer handles GET /transfers/{transfer_id}
@@ -81,7 +92,12 @@ func (h *TransferHandler) GetTransfer(w http.ResponseWriter, r *http.Request) {
 
 	transfer, err := h.transferService.GetTransfer(r.Context(), transfer_id)
 	if err != nil {
-		WriteError(w, http.StatusNotFound, "transfer not found")
+		if errors.Is(err, domain.ErrTransferNotFound) {
+			WriteError(w, http.StatusNotFound, "transfer not found")
+			return
+		}
+		log.Printf("[ERROR] failed to get transfer %s: %v", transfer_id, err)
+		WriteError(w, http.StatusInternalServerError, "internal server error")
 		return
 	}
 

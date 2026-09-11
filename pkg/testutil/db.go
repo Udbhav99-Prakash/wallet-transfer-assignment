@@ -22,7 +22,7 @@ func SetupTestDB(t *testing.T) *pgxpool.Pool {
 	ctx := context.Background()
 	pool, err := postgres.NewPool(ctx, dbURL)
 	if err != nil {
-		t.Skipf("Skipping integration test: cannot connect to PostgreSQL at %s: %v", dbURL, err)
+		t.Fatalf("failed to connect to PostgreSQL at %s: %v. Integration tests require a running PostgreSQL instance.", dbURL, err)
 		return nil
 	}
 
@@ -46,6 +46,9 @@ func SetupTestDB(t *testing.T) *pgxpool.Pool {
 		TRUNCATE TABLE ledger_entries, transfers, idempotency_records, wallets CASCADE;
 		INSERT INTO wallets (id, name, balance, currency)
 		VALUES ('system_treasury', 'System Treasury', 100000000000000, 'USD')
+		ON CONFLICT (id) DO NOTHING;
+		INSERT INTO ledger_entries (id, transfer_id, wallet_id, type, amount)
+		VALUES ('entry_system_treasury_opening', NULL, 'system_treasury', 'CREDIT', 100000000000000)
 		ON CONFLICT (id) DO NOTHING;
 	`
 	if _, err := pool.Exec(ctx, cleanupQuery); err != nil {

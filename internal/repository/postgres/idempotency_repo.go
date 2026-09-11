@@ -21,7 +21,7 @@ func NewIdempotencyRepository(db DBTX) repository.IdempotencyRepository {
 	return &idempotencyRepository{db: db}
 }
 
-func (r *idempotencyRepository) ReserveIdempotency(ctx context.Context, record *domain.IdempotencyRecord) (*domain.IdempotencyRecord, bool, error) {
+func (r *idempotencyRepository) ReserveIdempotency(ctx context.Context, record *domain.IdempotencyRecord, staleTimeout time.Duration) (*domain.IdempotencyRecord, bool, error) {
 	now := time.Now().UTC()
 	record.CreatedAt = now
 	record.UpdatedAt = now
@@ -52,6 +52,45 @@ func (r *idempotencyRepository) ReserveIdempotency(ctx context.Context, record *
 		if getErr != nil {
 			return nil, false, fmt.Errorf("failed to fetch conflicting idempotency record: %w", getErr)
 		}
+		if existing == nil {
+			return nil, false, fmt.Errorf("idempotency record disappeared during reservation")
+		}
+
+		// Explicit stale-owner recovery:
+		// If existing record is IN_PROGRESS and hasn't been updated for longer than staleTimeout,
+		// the previous owner likely crashed or timed out. Attempt to reclaim it atomically.
+		if staleTimeout > 0 && existing.Status == domain.IdempotencyStatusInProgress && now.Sub(existing.UpdatedAt) > staleTimeout {
+			reclaimQuery := `
+				UPDATE idempotency_records
+				SET request_hash = $1, status = $2, updated_at = $3
+				WHERE idempotency_key = $4 AND status = 'IN_PROGRESS' AND updated_at <= $5
+				RETURNING idempotency_key
+			`
+			var reclaimedKey string
+			reclaimErr := r.db.QueryRow(ctx, reclaimQuery,
+				record.RequestHash,
+				string(domain.IdempotencyStatusInProgress),
+				now,
+				record.IdempotencyKey,
+				existing.UpdatedAt,
+			).Scan(&reclaimedKey)
+
+			if reclaimErr == nil {
+				// Successfully reclaimed stale reservation
+				record.CreatedAt = existing.CreatedAt
+				record.UpdatedAt = now
+				return record, true, nil
+			}
+
+			if errors.Is(reclaimErr, pgx.ErrNoRows) {
+				// Another worker reclaimed or completed it concurrently; fetch latest state
+				refetched, refetchErr := r.GetIdempotency(ctx, record.IdempotencyKey)
+				if refetchErr == nil && refetched != nil {
+					return refetched, false, nil
+				}
+			}
+		}
+
 		return existing, false, nil
 	}
 
@@ -114,6 +153,18 @@ func (r *idempotencyRepository) UpdateIdempotency(ctx context.Context, record *d
 	)
 	if err != nil {
 		return fmt.Errorf("failed to update idempotency record: %w", err)
+	}
+	return nil
+}
+
+func (r *idempotencyRepository) DeleteIdempotency(ctx context.Context, key string) error {
+	query := `
+		DELETE FROM idempotency_records
+		WHERE idempotency_key = $1 AND status = 'IN_PROGRESS'
+	`
+	_, err := r.db.Exec(ctx, query, key)
+	if err != nil {
+		return fmt.Errorf("failed to delete in-progress idempotency reservation: %w", err)
 	}
 	return nil
 }

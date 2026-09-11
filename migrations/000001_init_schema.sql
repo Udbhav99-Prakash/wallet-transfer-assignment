@@ -24,12 +24,13 @@ CREATE TABLE IF NOT EXISTS transfers (
 
 CREATE TABLE IF NOT EXISTS ledger_entries (
     id VARCHAR(64) PRIMARY KEY,
-    transfer_id VARCHAR(64) NOT NULL REFERENCES transfers(id) ON DELETE RESTRICT,
+    transfer_id VARCHAR(64) REFERENCES transfers(id) ON DELETE RESTRICT,
     wallet_id VARCHAR(64) NOT NULL REFERENCES wallets(id) ON DELETE RESTRICT,
     type VARCHAR(16) NOT NULL CHECK (type IN ('DEBIT', 'CREDIT')),
     amount BIGINT NOT NULL CHECK (amount > 0),
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+ALTER TABLE ledger_entries ALTER COLUMN transfer_id DROP NOT NULL;
 
 CREATE TABLE IF NOT EXISTS idempotency_records (
     idempotency_key VARCHAR(128) PRIMARY KEY,
@@ -51,5 +52,11 @@ CREATE INDEX IF NOT EXISTS idx_ledger_transfer ON ledger_entries(transfer_id);
 INSERT INTO wallets (id, name, balance, currency)
 VALUES ('system_treasury', 'System Treasury', 100000000000000, 'USD')
 ON CONFLICT (id) DO NOTHING;
+
+-- Ledger opening funding record for system_treasury so stored balance reconciles with ledger
+INSERT INTO ledger_entries (id, transfer_id, wallet_id, type, amount)
+VALUES ('entry_system_treasury_opening', NULL, 'system_treasury', 'CREDIT', 100000000000000)
+ON CONFLICT (id) DO NOTHING;
+
 
 

@@ -25,6 +25,7 @@ type TransferResponse struct {
 	FailureReason  *string               `json:"failureReason,omitempty"`
 	CreatedAt      time.Time             `json:"createdAt"`
 	IsReplay       bool                  `json:"isReplay,omitempty"`
+	ResponseCode   int                   `json:"-"`
 }
 
 // CreateWalletRequest encapsulates parameters for seeding a new wallet.

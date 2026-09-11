@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -16,7 +18,7 @@ import (
 	"wallet-transfer-assignment/pkg/testutil"
 )
 
-func setupServices(t *testing.T) (*service.TransferService, *service.WalletService) {
+func setupServicesWithRepos(t *testing.T) (*service.TransferService, *service.WalletService, repository.Repositories) {
 	t.Helper()
 	pool := testutil.SetupTestDB(t)
 
@@ -29,9 +31,14 @@ func setupServices(t *testing.T) (*service.TransferService, *service.WalletServi
 	txManager := postgres.NewTxManager(pool)
 
 	transferService := service.NewTransferService(txManager, repos)
-	walletService := service.NewWalletService(repos)
+	walletService := service.NewWalletService(txManager, repos)
 
-	return transferService, walletService
+	return transferService, walletService, repos
+}
+
+func setupServices(t *testing.T) (*service.TransferService, *service.WalletService) {
+	transferSvc, walletSvc, _ := setupServicesWithRepos(t)
+	return transferSvc, walletSvc
 }
 
 func TestTransferService_Success(t *testing.T) {
@@ -226,6 +233,12 @@ func TestTransferService_IdempotencyReplay(t *testing.T) {
 	if resp2.TransferID != resp1.TransferID {
 		t.Fatalf("expected same transfer ID, got %s and %s", resp1.TransferID, resp2.TransferID)
 	}
+	if resp1.ResponseCode != 201 {
+		t.Fatalf("expected first response code 201, got %d", resp1.ResponseCode)
+	}
+	if resp2.ResponseCode != 201 {
+		t.Fatalf("expected replayed response code 201, got %d", resp2.ResponseCode)
+	}
 
 	// Verify balance was only deducted ONCE
 	w1After, _ := walletSvc.GetWallet(ctx, w1.ID)
@@ -278,8 +291,132 @@ func TestTransferService_IdempotencyConflict(t *testing.T) {
 	}
 }
 
-func TestTransferService_ConcurrentDebits_NoDoubleSpend(t *testing.T) {
+func TestTransferService_IdempotencyConflict_InvalidPayload(t *testing.T) {
 	ctx := context.Background()
+	transferSvc, walletSvc := setupServices(t)
+
+	w1, _ := walletSvc.CreateWallet(ctx, service.CreateWalletRequest{
+		ID:             "wallet_cp_1",
+		Name:           "Sender",
+		InitialBalance: 1000,
+	})
+	w2, _ := walletSvc.CreateWallet(ctx, service.CreateWalletRequest{
+		ID:             "wallet_cp_2",
+		Name:           "Receiver",
+		InitialBalance: 100,
+	})
+
+	// 1. First transfer with valid payload and key K
+	key := "conflict_invalid_payload_key"
+	reqValid := service.CreateTransferRequest{
+		IdempotencyKey: key,
+		FromWalletID:   w1.ID,
+		ToWalletID:     w2.ID,
+		Amount:         100,
+	}
+	_, err := transferSvc.ExecuteTransfer(ctx, reqValid)
+	if err != nil {
+		t.Fatalf("initial transfer failed: %v", err)
+	}
+
+	// 2. Reuse key K with negative amount: must return ErrIdempotencyConflict, NOT ErrInvalidAmount
+	reqNegAmount := service.CreateTransferRequest{
+		IdempotencyKey: key,
+		FromWalletID:   w1.ID,
+		ToWalletID:     w2.ID,
+		Amount:         -50,
+	}
+	_, err = transferSvc.ExecuteTransfer(ctx, reqNegAmount)
+	if !errors.Is(err, domain.ErrIdempotencyConflict) {
+		t.Fatalf("expected ErrIdempotencyConflict on negative amount reuse, got %v", err)
+	}
+
+	// 3. Reuse key K with zero amount: must return ErrIdempotencyConflict, NOT ErrInvalidAmount
+	reqZeroAmount := service.CreateTransferRequest{
+		IdempotencyKey: key,
+		FromWalletID:   w1.ID,
+		ToWalletID:     w2.ID,
+		Amount:         0,
+	}
+	_, err = transferSvc.ExecuteTransfer(ctx, reqZeroAmount)
+	if !errors.Is(err, domain.ErrIdempotencyConflict) {
+		t.Fatalf("expected ErrIdempotencyConflict on zero amount reuse, got %v", err)
+	}
+
+	// 4. Reuse key K with missing from_wallet_id: must return ErrIdempotencyConflict, NOT ErrWalletNotFound
+	reqMissingWallet := service.CreateTransferRequest{
+		IdempotencyKey: key,
+		FromWalletID:   "",
+		ToWalletID:     w2.ID,
+		Amount:         100,
+	}
+	_, err = transferSvc.ExecuteTransfer(ctx, reqMissingWallet)
+	if !errors.Is(err, domain.ErrIdempotencyConflict) {
+		t.Fatalf("expected ErrIdempotencyConflict on missing wallet reuse, got %v", err)
+	}
+
+	// 5. Reuse key K with same wallet ID: must return ErrIdempotencyConflict, NOT ErrSameWalletTransfer
+	reqSameWallet := service.CreateTransferRequest{
+		IdempotencyKey: key,
+		FromWalletID:   w1.ID,
+		ToWalletID:     w1.ID,
+		Amount:         100,
+	}
+	_, err = transferSvc.ExecuteTransfer(ctx, reqSameWallet)
+	if !errors.Is(err, domain.ErrIdempotencyConflict) {
+		t.Fatalf("expected ErrIdempotencyConflict on same-wallet reuse, got %v", err)
+	}
+
+	// 6. Contrast with a BRAND NEW key: invalid payloads must return their specific validation errors
+	newKey := "brand_new_unused_key"
+	_, err = transferSvc.ExecuteTransfer(ctx, service.CreateTransferRequest{
+		IdempotencyKey: newKey,
+		FromWalletID:   w1.ID,
+		ToWalletID:     w2.ID,
+		Amount:         -10,
+	})
+	if !errors.Is(err, domain.ErrInvalidAmount) {
+		t.Fatalf("expected ErrInvalidAmount for brand new key with negative amount, got %v", err)
+	}
+
+	// Missing idempotency key
+	_, err = transferSvc.ExecuteTransfer(ctx, service.CreateTransferRequest{
+		IdempotencyKey: "",
+		FromWalletID:   w1.ID,
+		ToWalletID:     w2.ID,
+		Amount:         100,
+	})
+	if !errors.Is(err, domain.ErrMissingIdempotencyKey) {
+		t.Fatalf("expected ErrMissingIdempotencyKey for empty idempotency key, got %v", err)
+	}
+
+	// Missing wallet ID (empty string)
+	_, err = transferSvc.ExecuteTransfer(ctx, service.CreateTransferRequest{
+		IdempotencyKey: newKey,
+		FromWalletID:   "",
+		ToWalletID:     w2.ID,
+		Amount:         100,
+	})
+	if !errors.Is(err, domain.ErrMissingWalletID) {
+		t.Fatalf("expected ErrMissingWalletID for brand new key with missing wallet, got %v", err)
+	}
+
+	// Non-existent wallet ID (wallet does not exist in DB)
+	_, err = transferSvc.ExecuteTransfer(ctx, service.CreateTransferRequest{
+		IdempotencyKey: "non_existent_wallet_test_key",
+		FromWalletID:   "non_existent_sender_id",
+		ToWalletID:     w2.ID,
+		Amount:         100,
+	})
+	if !errors.Is(err, domain.ErrWalletNotFound) {
+		t.Fatalf("expected ErrWalletNotFound when wallet does not exist in DB, got %v", err)
+	}
+}
+
+func TestTransferService_ConcurrentDebits_NoDoubleSpend(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
 	transferSvc, walletSvc := setupServices(t)
 
 	// Seed source wallet with 1,000 cents ($10.00)
@@ -326,7 +463,18 @@ func TestTransferService_ConcurrentDebits_NoDoubleSpend(t *testing.T) {
 		}()
 	}
 
-	wg.Wait()
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Succeeded within timeout
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for concurrent transfers to complete (possible deadlock or blocked row lock)")
+	}
 
 	var successCount, failedCount int
 	for _, r := range results {
@@ -371,7 +519,9 @@ func TestTransferService_ConcurrentDebits_NoDoubleSpend(t *testing.T) {
 }
 
 func TestTransferService_ConcurrentBidirectional_NoDeadlocks(t *testing.T) {
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
 	transferSvc, walletSvc := setupServices(t)
 
 	// Seed two wallets with ample balance
@@ -430,7 +580,18 @@ func TestTransferService_ConcurrentBidirectional_NoDeadlocks(t *testing.T) {
 		}(i)
 	}
 
-	wg.Wait()
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Succeeded within timeout
+	case <-time.After(15 * time.Second):
+		t.Fatal("timed out waiting for concurrent bidirectional transfers to complete (possible deadlock or blocked row lock)")
+	}
 	close(errorsChan)
 
 	for err := range errorsChan {
@@ -446,5 +607,472 @@ func TestTransferService_ConcurrentBidirectional_NoDeadlocks(t *testing.T) {
 	}
 	if finalB.Balance != 10000 {
 		t.Fatalf("expected wallet B balance 10000, got %d", finalB.Balance)
+	}
+}
+
+func TestTransferService_IdempotencyInProgress(t *testing.T) {
+	ctx := context.Background()
+	transferSvc, walletSvc, repos := setupServicesWithRepos(t)
+
+	w1, _ := walletSvc.CreateWallet(ctx, service.CreateWalletRequest{
+		ID:             "w_in_progress_1",
+		Name:           "Sender",
+		InitialBalance: 1000,
+	})
+	w2, _ := walletSvc.CreateWallet(ctx, service.CreateWalletRequest{
+		ID:             "w_in_progress_2",
+		Name:           "Receiver",
+		InitialBalance: 0,
+	})
+
+	req := service.CreateTransferRequest{
+		IdempotencyKey: "in_progress_key_1",
+		FromWalletID:   w1.ID,
+		ToWalletID:     w2.ID,
+		Amount:         100,
+	}
+
+	// Pre-reserve the key with status IN_PROGRESS to simulate an active concurrent execution
+	reqHash := domain.ComputeRequestHash(req.FromWalletID, req.ToWalletID, req.Amount)
+	_, _, err := repos.Idempotency.ReserveIdempotency(ctx, &domain.IdempotencyRecord{
+		IdempotencyKey: req.IdempotencyKey,
+		RequestHash:    reqHash,
+		Status:         domain.IdempotencyStatusInProgress,
+	}, 30*time.Second)
+	if err != nil {
+		t.Fatalf("failed to seed in-progress idempotency reservation: %v", err)
+	}
+
+	// Overlapping concurrent request must immediately receive ErrIdempotencyInProgress without blocking
+	_, err = transferSvc.ExecuteTransfer(ctx, req)
+	if !errors.Is(err, domain.ErrIdempotencyInProgress) {
+		t.Fatalf("expected ErrIdempotencyInProgress, got %v", err)
+	}
+}
+
+func TestTransferService_StaleOwnerRecovery(t *testing.T) {
+	ctx := context.Background()
+	transferSvc, walletSvc, repos := setupServicesWithRepos(t)
+
+	// Configure a short stale timeout for testing
+	transferSvc.SetStaleTimeout(50 * time.Millisecond)
+
+	w1, _ := walletSvc.CreateWallet(ctx, service.CreateWalletRequest{
+		ID:             "w_stale_1",
+		Name:           "Sender",
+		InitialBalance: 1000,
+	})
+	w2, _ := walletSvc.CreateWallet(ctx, service.CreateWalletRequest{
+		ID:             "w_stale_2",
+		Name:           "Receiver",
+		InitialBalance: 0,
+	})
+
+	req := service.CreateTransferRequest{
+		IdempotencyKey: "stale_key_1",
+		FromWalletID:   w1.ID,
+		ToWalletID:     w2.ID,
+		Amount:         100,
+	}
+
+	// Seed an IN_PROGRESS reservation
+	reqHash := domain.ComputeRequestHash(req.FromWalletID, req.ToWalletID, req.Amount)
+	_, _, err := repos.Idempotency.ReserveIdempotency(ctx, &domain.IdempotencyRecord{
+		IdempotencyKey: req.IdempotencyKey,
+		RequestHash:    reqHash,
+		Status:         domain.IdempotencyStatusInProgress,
+	}, 30*time.Second)
+	if err != nil {
+		t.Fatalf("failed to seed in-progress idempotency reservation: %v", err)
+	}
+
+	// Wait for the stale timeout to elapse
+	time.Sleep(70 * time.Millisecond)
+
+	// The stale lock should be reclaimed and the transfer should succeed
+	resp, err := transferSvc.ExecuteTransfer(ctx, req)
+	if err != nil {
+		t.Fatalf("expected successful transfer after stale lock recovery, got %v", err)
+	}
+	if resp.Status != domain.TransferStatusProcessed {
+		t.Fatalf("expected transfer status PROCESSED, got %s", resp.Status)
+	}
+
+	// Verify balance was updated
+	w1After, _ := walletSvc.GetWallet(ctx, w1.ID)
+	if w1After.Balance != 900 {
+		t.Fatalf("expected sender balance 900, got %d", w1After.Balance)
+	}
+	w2After, _ := walletSvc.GetWallet(ctx, w2.ID)
+	if w2After.Balance != 100 {
+		t.Fatalf("expected receiver balance 100, got %d", w2After.Balance)
+	}
+}
+
+func TestTransferService_DeferredCleanupOnFailure(t *testing.T) {
+	ctx := context.Background()
+	transferSvc, walletSvc, repos := setupServicesWithRepos(t)
+
+	w1, _ := walletSvc.CreateWallet(ctx, service.CreateWalletRequest{
+		ID:             "w_cleanup_1",
+		Name:           "Sender",
+		InitialBalance: 1000,
+	})
+	w2, _ := walletSvc.CreateWallet(ctx, service.CreateWalletRequest{
+		ID:             "w_cleanup_2",
+		Name:           "Receiver",
+		InitialBalance: 0,
+	})
+
+	req := service.CreateTransferRequest{
+		IdempotencyKey: "cleanup_key_1",
+		FromWalletID:   w1.ID,
+		ToWalletID:     w2.ID,
+		Amount:         100,
+	}
+
+	// Create a pre-cancelled context to simulate an unexpected abort/timeout during transfer execution
+	cancelledCtx, cancel := context.WithCancel(ctx)
+	cancel()
+
+	_, err := transferSvc.ExecuteTransfer(cancelledCtx, req)
+	if err == nil {
+		t.Fatalf("expected transfer with cancelled context to fail")
+	}
+
+	// The deferred cleanup should have deleted the IN_PROGRESS reservation.
+	// Verify that the key is not locked in idempotency_records:
+	rec, err := repos.Idempotency.GetIdempotency(ctx, req.IdempotencyKey)
+	if err != nil {
+		t.Fatalf("unexpected error fetching idempotency record: %v", err)
+	}
+	if rec != nil {
+		t.Fatalf("expected idempotency record to be deleted by deferred cleanup, but found record with status %s", rec.Status)
+	}
+
+	// Subsequent transfer with the same key should succeed immediately without waiting for stale timeout
+	resp, err := transferSvc.ExecuteTransfer(ctx, req)
+	if err != nil {
+		t.Fatalf("retry after failure failed: %v", err)
+	}
+	if resp.Status != domain.TransferStatusProcessed {
+		t.Fatalf("expected transfer status PROCESSED, got %s", resp.Status)
+	}
+}
+
+func TestTransferService_DestinationBalanceOverflow(t *testing.T) {
+	ctx := context.Background()
+	transferSvc, walletSvc, repos := setupServicesWithRepos(t)
+
+	// Create sender wallet with 500
+	w1, err := walletSvc.CreateWallet(ctx, service.CreateWalletRequest{
+		ID:             "w_ovf_sender",
+		Name:           "Sender",
+		InitialBalance: 500,
+	})
+	if err != nil {
+		t.Fatalf("failed to create sender wallet: %v", err)
+	}
+
+	// Create destination wallet with near-maximum balance (math.MaxInt64 - 50)
+	destInitialBalance := int64(math.MaxInt64 - 50)
+	w2 := &domain.Wallet{
+		ID:       "w_ovf_dest",
+		Name:     "Destination",
+		Balance:  destInitialBalance,
+		Currency: "USD",
+	}
+	if err := repos.Wallets.CreateWallet(ctx, w2); err != nil {
+		t.Fatalf("failed to create destination wallet: %v", err)
+	}
+
+	// Attempt to transfer 100 to destination wallet, which would exceed math.MaxInt64
+	req := service.CreateTransferRequest{
+		IdempotencyKey: "key_overflow_test_1",
+		FromWalletID:   w1.ID,
+		ToWalletID:     w2.ID,
+		Amount:         100,
+	}
+
+	resp, err := transferSvc.ExecuteTransfer(ctx, req)
+	if err == nil {
+		t.Fatalf("expected ErrBalanceOverflow, but got nil error and resp: %+v", resp)
+	}
+	if !errors.Is(err, domain.ErrBalanceOverflow) {
+		t.Fatalf("expected errors.Is(err, domain.ErrBalanceOverflow), got %v", err)
+	}
+
+	// Verify sender balance is unchanged (500)
+	w1After, err := walletSvc.GetWallet(ctx, w1.ID)
+	if err != nil {
+		t.Fatalf("failed to get sender wallet: %v", err)
+	}
+	if w1After.Balance != 500 {
+		t.Fatalf("expected sender balance to remain 500, got %d", w1After.Balance)
+	}
+
+	// Verify destination balance is unchanged (math.MaxInt64 - 50)
+	w2After, err := walletSvc.GetWallet(ctx, w2.ID)
+	if err != nil {
+		t.Fatalf("failed to get destination wallet: %v", err)
+	}
+	if w2After.Balance != destInitialBalance {
+		t.Fatalf("expected destination balance to remain %d, got %d", destInitialBalance, w2After.Balance)
+	}
+
+	// Verify no idempotency lock is left stuck in IN_PROGRESS
+	rec, err := repos.Idempotency.GetIdempotency(ctx, req.IdempotencyKey)
+	if err != nil {
+		t.Fatalf("failed to get idempotency record: %v", err)
+	}
+	if rec != nil {
+		t.Fatalf("expected idempotency record to be cleaned up after overflow abort, but found: %+v", rec)
+	}
+}
+
+func TestWalletService_SystemTreasuryReconciliation(t *testing.T) {
+	ctx := context.Background()
+	_, walletSvc, _ := setupServicesWithRepos(t)
+
+	const treasuryOpeningBalance int64 = 100000000000000
+
+	// 1. Immediately on clean database before any user wallet is created,
+	// system_treasury must reconcile with its opening ledger funding record.
+	storedBal, ledgerBal, isBalanced, err := walletSvc.ReconcileBalance(ctx, "system_treasury")
+	if err != nil {
+		t.Fatalf("failed to reconcile system_treasury: %v", err)
+	}
+	if !isBalanced {
+		t.Fatalf("expected system_treasury to be balanced on startup, got stored=%d ledger=%d", storedBal, ledgerBal)
+	}
+	if storedBal != treasuryOpeningBalance || ledgerBal != treasuryOpeningBalance {
+		t.Fatalf("expected balances to equal %d, got stored=%d ledger=%d", treasuryOpeningBalance, storedBal, ledgerBal)
+	}
+
+	// 2. Create a user wallet with initial balance 500
+	userWallet, err := walletSvc.CreateWallet(ctx, service.CreateWalletRequest{
+		ID:             "w_treasury_test_user",
+		Name:           "User",
+		InitialBalance: 500,
+	})
+	if err != nil {
+		t.Fatalf("failed to create user wallet: %v", err)
+	}
+
+	// 3. User wallet must reconcile
+	uStored, uLedger, uBalanced, err := walletSvc.ReconcileBalance(ctx, userWallet.ID)
+	if err != nil || !uBalanced {
+		t.Fatalf("expected user wallet to be balanced, got stored=%d ledger=%d err=%v", uStored, uLedger, err)
+	}
+	if uStored != 500 || uLedger != 500 {
+		t.Fatalf("expected user wallet balance 500, got stored=%d ledger=%d", uStored, uLedger)
+	}
+
+	// 4. System treasury must remain balanced after funding the user wallet
+	tStored, tLedger, tBalanced, err := walletSvc.ReconcileBalance(ctx, "system_treasury")
+	if err != nil || !tBalanced {
+		t.Fatalf("expected system_treasury to remain balanced after user funding, got stored=%d ledger=%d err=%v", tStored, tLedger, err)
+	}
+	expectedTreasuryBal := treasuryOpeningBalance - 500
+	if tStored != expectedTreasuryBal || tLedger != expectedTreasuryBal {
+		t.Fatalf("expected treasury balance %d, got stored=%d ledger=%d", expectedTreasuryBal, tStored, tLedger)
+	}
+}
+
+func TestTransferService_CurrencyMismatch(t *testing.T) {
+	ctx := context.Background()
+	transferSvc, walletSvc, repos := setupServicesWithRepos(t)
+
+	// Create USD wallet
+	wUSD, err := walletSvc.CreateWallet(ctx, service.CreateWalletRequest{
+		ID:             "w_curr_usd",
+		Name:           "USD User",
+		InitialBalance: 500,
+		Currency:       "USD",
+	})
+	if err != nil {
+		t.Fatalf("failed to create USD wallet: %v", err)
+	}
+
+	// Create EUR wallet (0 initial balance so no treasury currency conversion is needed)
+	wEUR, err := walletSvc.CreateWallet(ctx, service.CreateWalletRequest{
+		ID:             "w_curr_eur",
+		Name:           "EUR User",
+		InitialBalance: 0,
+		Currency:       "EUR",
+	})
+	if err != nil {
+		t.Fatalf("failed to create EUR wallet: %v", err)
+	}
+
+	// Attempt transfer from USD to EUR wallet
+	req := service.CreateTransferRequest{
+		IdempotencyKey: "curr_mismatch_key_1",
+		FromWalletID:   wUSD.ID,
+		ToWalletID:     wEUR.ID,
+		Amount:         100,
+	}
+
+	resp, err := transferSvc.ExecuteTransfer(ctx, req)
+	if err == nil {
+		t.Fatalf("expected ErrCurrencyMismatch, got nil error and resp: %+v", resp)
+	}
+	if !errors.Is(err, domain.ErrCurrencyMismatch) {
+		t.Fatalf("expected errors.Is(err, domain.ErrCurrencyMismatch), got %v", err)
+	}
+
+	// Assert balances remained unchanged
+	u1, _ := walletSvc.GetWallet(ctx, wUSD.ID)
+	if u1.Balance != 500 {
+		t.Fatalf("expected USD wallet balance 500, got %d", u1.Balance)
+	}
+	u2, _ := walletSvc.GetWallet(ctx, wEUR.ID)
+	if u2.Balance != 0 {
+		t.Fatalf("expected EUR wallet balance 0, got %d", u2.Balance)
+	}
+
+	// Assert idempotency record was cleaned up
+	rec, err := repos.Idempotency.GetIdempotency(ctx, req.IdempotencyKey)
+	if err != nil {
+		t.Fatalf("unexpected error querying idempotency: %v", err)
+	}
+	if rec != nil {
+		t.Fatalf("expected idempotency record to be cleaned up after currency mismatch error, but found: %+v", rec)
+	}
+}
+
+func TestWalletService_CreateWallet_TransactionalRollback(t *testing.T) {
+	ctx := context.Background()
+	_, walletSvc, repos := setupServicesWithRepos(t)
+
+	// Attempt to create a wallet with currency EUR and initial balance 500.
+	// Since system_treasury is USD, this will fail with ErrCurrencyMismatch during initial funding.
+	// The transaction must roll back the wallet creation entirely.
+	failedID := "w_atomic_rollback_test"
+	_, err := walletSvc.CreateWallet(ctx, service.CreateWalletRequest{
+		ID:             failedID,
+		Name:           "EUR User",
+		InitialBalance: 500,
+		Currency:       "EUR",
+	})
+	if err == nil {
+		t.Fatalf("expected error creating cross-currency funded wallet, got nil")
+	}
+	if !errors.Is(err, domain.ErrCurrencyMismatch) {
+		t.Fatalf("expected ErrCurrencyMismatch, got %v", err)
+	}
+
+	// Verify wallet row was NOT committed
+	w, err := repos.Wallets.GetWalletByID(ctx, failedID)
+	if err == nil || !errors.Is(err, domain.ErrWalletNotFound) {
+		t.Fatalf("expected wallet to not exist after rollback, got %v (wallet: %+v)", err, w)
+	}
+
+	// Verify the same ID can now be created cleanly with valid parameters
+	wCreated, err := walletSvc.CreateWallet(ctx, service.CreateWalletRequest{
+		ID:             failedID,
+		Name:           "USD User",
+		InitialBalance: 100,
+		Currency:       "USD",
+	})
+	if err != nil {
+		t.Fatalf("failed to create wallet with reused ID after previous rollback: %v", err)
+	}
+	if wCreated.ID != failedID || wCreated.Balance != 100 {
+		t.Fatalf("unexpected wallet state: %+v", wCreated)
+	}
+}
+
+func TestWalletService_ReconcileBalance_ConcurrentTransfers(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	transferSvc, walletSvc := setupServices(t)
+
+	w1, err := walletSvc.CreateWallet(ctx, service.CreateWalletRequest{
+		ID:             "reconcile_conc_w1",
+		Name:           "Conc Sender",
+		InitialBalance: 10000,
+	})
+	if err != nil {
+		t.Fatalf("failed to create wallet 1: %v", err)
+	}
+
+	w2, err := walletSvc.CreateWallet(ctx, service.CreateWalletRequest{
+		ID:             "reconcile_conc_w2",
+		Name:           "Conc Receiver",
+		InitialBalance: 0,
+	})
+	if err != nil {
+		t.Fatalf("failed to create wallet 2: %v", err)
+	}
+
+	var wg sync.WaitGroup
+	stopReconcile := make(chan struct{})
+	reconcileErrCh := make(chan error, 50)
+
+	// Run concurrent transfers
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			_, _ = transferSvc.ExecuteTransfer(ctx, service.CreateTransferRequest{
+				IdempotencyKey: fmt.Sprintf("reconcile-tx-%d", idx),
+				FromWalletID:   w1.ID,
+				ToWalletID:     w2.ID,
+				Amount:         50,
+			})
+		}(i)
+	}
+
+	// Concurrently reconcile balance
+	reconcileWg := sync.WaitGroup{}
+	reconcileWg.Add(1)
+	go func() {
+		defer reconcileWg.Done()
+		for {
+			select {
+			case <-stopReconcile:
+				return
+			default:
+				stored, ledger, isBalanced, err := walletSvc.ReconcileBalance(ctx, w1.ID)
+				if err != nil {
+					reconcileErrCh <- fmt.Errorf("reconcile error: %w", err)
+					return
+				}
+				if !isBalanced {
+					reconcileErrCh <- fmt.Errorf("false mismatch detected! stored=%d, ledger=%d", stored, ledger)
+					return
+				}
+			}
+		}
+	}()
+
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Completed within timeout
+	case <-time.After(15 * time.Second):
+		close(stopReconcile)
+		t.Fatal("timed out waiting for concurrent transfers to complete (possible deadlock or blocked row lock)")
+	}
+
+	close(stopReconcile)
+	reconcileWg.Wait()
+	close(reconcileErrCh)
+
+	for err := range reconcileErrCh {
+		t.Fatal(err)
+	}
+
+	// Final verification
+	stored, ledger, isBalanced, err := walletSvc.ReconcileBalance(ctx, w1.ID)
+	if err != nil || !isBalanced {
+		t.Fatalf("final reconcile failed: stored=%d, ledger=%d, balanced=%v, err=%v", stored, ledger, isBalanced, err)
 	}
 }

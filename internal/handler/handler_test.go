@@ -2,10 +2,13 @@ package handler_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"wallet-transfer-assignment/internal/domain"
 	"wallet-transfer-assignment/internal/handler"
@@ -15,7 +18,7 @@ import (
 	"wallet-transfer-assignment/pkg/testutil"
 )
 
-func setupTestServer(t *testing.T) http.Handler {
+func setupTestServerWithRepos(t *testing.T) (http.Handler, repository.Repositories) {
 	t.Helper()
 	pool := testutil.SetupTestDB(t)
 
@@ -28,7 +31,7 @@ func setupTestServer(t *testing.T) http.Handler {
 	txManager := postgres.NewTxManager(pool)
 
 	transferService := service.NewTransferService(txManager, repos)
-	walletService := service.NewWalletService(repos)
+	walletService := service.NewWalletService(txManager, repos)
 
 	transferHandler := handler.NewTransferHandler(transferService)
 	walletHandler := handler.NewWalletHandler(walletService)
@@ -36,7 +39,12 @@ func setupTestServer(t *testing.T) http.Handler {
 	return handler.NewRouter(handler.Config{
 		TransferHandler: transferHandler,
 		WalletHandler:   walletHandler,
-	})
+	}), repos
+}
+
+func setupTestServer(t *testing.T) http.Handler {
+	router, _ := setupTestServerWithRepos(t)
+	return router
 }
 
 func TestHandler_HealthCheck(t *testing.T) {
@@ -109,14 +117,14 @@ func TestHandler_TransferWorkflow(t *testing.T) {
 		t.Fatalf("expected status PROCESSED, got %s", createdTx.Status)
 	}
 
-	// 4. POST /transfers - Replay with same idempotency key -> 200 OK
+	// 4. POST /transfers - Replay with same idempotency key -> preserves 201 Created
 	txReplayReq := httptest.NewRequest(http.MethodPost, "/transfers", bytes.NewReader(transferReqBody))
 	txReplayReq.Header.Set("Content-Type", "application/json")
 	txReplayRecorder := httptest.NewRecorder()
 	router.ServeHTTP(txReplayRecorder, txReplayReq)
 
-	if txReplayRecorder.Code != http.StatusOK {
-		t.Fatalf("expected 200 OK on replay, got %d: %s", txReplayRecorder.Code, txReplayRecorder.Body.String())
+	if txReplayRecorder.Code != http.StatusCreated {
+		t.Fatalf("expected 201 Created on replay, got %d: %s", txReplayRecorder.Code, txReplayRecorder.Body.String())
 	}
 
 	var replayTx service.TransferResponse
@@ -184,6 +192,16 @@ func TestHandler_TransferWorkflow(t *testing.T) {
 		t.Fatalf("expected 422 Unprocessable Entity, got %d: %s", overdraftRecorder.Code, overdraftRecorder.Body.String())
 	}
 
+	// 9b. Replay overdraft transfer -> preserves 422 Unprocessable Entity
+	overdraftReplayReq := httptest.NewRequest(http.MethodPost, "/transfers", bytes.NewReader(overdraftBody))
+	overdraftReplayReq.Header.Set("Content-Type", "application/json")
+	overdraftReplayRecorder := httptest.NewRecorder()
+	router.ServeHTTP(overdraftReplayRecorder, overdraftReplayReq)
+
+	if overdraftReplayRecorder.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422 Unprocessable Entity on overdraft replay, got %d: %s", overdraftReplayRecorder.Code, overdraftReplayRecorder.Body.String())
+	}
+
 	// 10. Same wallet transfer -> 400 Bad Request
 	selfTransferBody, _ := json.Marshal(service.CreateTransferRequest{
 		IdempotencyKey: "self_tx",
@@ -197,5 +215,372 @@ func TestHandler_TransferWorkflow(t *testing.T) {
 
 	if selfRecorder.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 Bad Request on self transfer, got %d", selfRecorder.Code)
+	}
+
+	// 11. Empty idempotency key -> 400 Bad Request
+	emptyKeyBody, _ := json.Marshal(service.CreateTransferRequest{
+		IdempotencyKey: "",
+		FromWalletID:   "hw_1",
+		ToWalletID:     "hw_2",
+		Amount:         50,
+	})
+	emptyKeyReq := httptest.NewRequest(http.MethodPost, "/transfers", bytes.NewReader(emptyKeyBody))
+	emptyKeyReq.Header.Set("Content-Type", "application/json")
+	emptyKeyRecorder := httptest.NewRecorder()
+	router.ServeHTTP(emptyKeyRecorder, emptyKeyReq)
+
+	if emptyKeyRecorder.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 Bad Request on empty idempotency key, got %d: %s", emptyKeyRecorder.Code, emptyKeyRecorder.Body.String())
+	}
+
+	// 12. Empty wallet ID -> 400 Bad Request
+	emptyWalletBody, _ := json.Marshal(service.CreateTransferRequest{
+		IdempotencyKey: "empty_wallet_tx",
+		FromWalletID:   "",
+		ToWalletID:     "hw_2",
+		Amount:         50,
+	})
+	emptyWalletReq := httptest.NewRequest(http.MethodPost, "/transfers", bytes.NewReader(emptyWalletBody))
+	emptyWalletReq.Header.Set("Content-Type", "application/json")
+	emptyWalletRecorder := httptest.NewRecorder()
+	router.ServeHTTP(emptyWalletRecorder, emptyWalletReq)
+
+	if emptyWalletRecorder.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 Bad Request on empty wallet ID, got %d: %s", emptyWalletRecorder.Code, emptyWalletRecorder.Body.String())
+	}
+
+	// 13. Non-existent wallet ID -> 404 Not Found
+	nonExistentBody, _ := json.Marshal(service.CreateTransferRequest{
+		IdempotencyKey: "non_existent_wallet_tx",
+		FromWalletID:   "does_not_exist_1",
+		ToWalletID:     "hw_2",
+		Amount:         50,
+	})
+	nonExistentReq := httptest.NewRequest(http.MethodPost, "/transfers", bytes.NewReader(nonExistentBody))
+	nonExistentReq.Header.Set("Content-Type", "application/json")
+	nonExistentRecorder := httptest.NewRecorder()
+	router.ServeHTTP(nonExistentRecorder, nonExistentReq)
+
+	if nonExistentRecorder.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 Not Found on non-existent wallet ID, got %d: %s", nonExistentRecorder.Code, nonExistentRecorder.Body.String())
+	}
+}
+
+func TestHandler_IdempotencyInProgress_Conflict(t *testing.T) {
+	router, repos := setupTestServerWithRepos(t)
+	ctx := context.Background()
+
+	// Seed source and dest wallets
+	_ = repos.Wallets.CreateWallet(ctx, &domain.Wallet{ID: "w_idem_1", Name: "User 1", Balance: 500, Currency: "USD"})
+	_ = repos.Wallets.CreateWallet(ctx, &domain.Wallet{ID: "w_idem_2", Name: "User 2", Balance: 500, Currency: "USD"})
+
+	reqBody, _ := json.Marshal(service.CreateTransferRequest{
+		IdempotencyKey: "concurrent_key_409",
+		FromWalletID:   "w_idem_1",
+		ToWalletID:     "w_idem_2",
+		Amount:         100,
+	})
+
+	// Pre-seed an IN_PROGRESS reservation in DB
+	reqHash := domain.ComputeRequestHash("w_idem_1", "w_idem_2", 100)
+	_, _, err := repos.Idempotency.ReserveIdempotency(ctx, &domain.IdempotencyRecord{
+		IdempotencyKey: "concurrent_key_409",
+		RequestHash:    reqHash,
+		Status:         domain.IdempotencyStatusInProgress,
+	}, 30*time.Second)
+	if err != nil {
+		t.Fatalf("failed to seed reservation: %v", err)
+	}
+
+	// Make HTTP POST request
+	req := httptest.NewRequest(http.MethodPost, "/transfers", bytes.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	// Must return HTTP 409 Conflict immediately
+	if w.Code != http.StatusConflict {
+		t.Fatalf("expected 409 Conflict, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestHandler_IdempotencyConflict_PayloadMismatch(t *testing.T) {
+	router, repos := setupTestServerWithRepos(t)
+	ctx := context.Background()
+
+	// Seed wallets
+	_ = repos.Wallets.CreateWallet(ctx, &domain.Wallet{ID: "w_col_1", Name: "User 1", Balance: 500, Currency: "USD"})
+	_ = repos.Wallets.CreateWallet(ctx, &domain.Wallet{ID: "w_col_2", Name: "User 2", Balance: 500, Currency: "USD"})
+	_ = repos.Wallets.CreateWallet(ctx, &domain.Wallet{ID: "w_col_3", Name: "User 3", Balance: 500, Currency: "USD"})
+
+	// Pre-seed a COMPLETED idempotency record with hash for (w_col_1 -> w_col_2, 100)
+	firstHash := domain.ComputeRequestHash("w_col_1", "w_col_2", 100)
+	dummyResp := `{"transfer_id":"some_id","status":"PROCESSED"}`
+	rec := &domain.IdempotencyRecord{
+		IdempotencyKey: "reused_key_mismatch",
+		RequestHash:    firstHash,
+		Status:         domain.IdempotencyStatusCompleted,
+		ResponseCode:   200,
+		ResponseBody:   dummyResp,
+	}
+	_, _, _ = repos.Idempotency.ReserveIdempotency(ctx, rec, 30*time.Second)
+	_ = repos.Idempotency.UpdateIdempotency(ctx, rec)
+
+	// Attempt transfer with same key but DIFFERENT recipient (w_col_3 instead of w_col_2)
+	reqBody, _ := json.Marshal(service.CreateTransferRequest{
+		IdempotencyKey: "reused_key_mismatch",
+		FromWalletID:   "w_col_1",
+		ToWalletID:     "w_col_3",
+		Amount:         100,
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/transfers", bytes.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	// Must return HTTP 409 Conflict
+	if w.Code != http.StatusConflict {
+		t.Fatalf("expected 409 Conflict for payload mismatch, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// Attempt transfer with same key but INVALID amount (-50)
+	// Must return HTTP 409 Conflict, NOT 400 Bad Request
+	reqInvalidAmount, _ := json.Marshal(service.CreateTransferRequest{
+		IdempotencyKey: "reused_key_mismatch",
+		FromWalletID:   "w_col_1",
+		ToWalletID:     "w_col_2",
+		Amount:         -50,
+	})
+	req2 := httptest.NewRequest(http.MethodPost, "/transfers", bytes.NewReader(reqInvalidAmount))
+	req2.Header.Set("Content-Type", "application/json")
+	w2 := httptest.NewRecorder()
+	router.ServeHTTP(w2, req2)
+
+	if w2.Code != http.StatusConflict {
+		t.Fatalf("expected 409 Conflict for reused key with invalid amount, got %d: %s", w2.Code, w2.Body.String())
+	}
+}
+
+func TestHandler_Transfer_BalanceOverflow(t *testing.T) {
+	router, repos := setupTestServerWithRepos(t)
+	ctx := context.Background()
+
+	_ = repos.Wallets.CreateWallet(ctx, &domain.Wallet{ID: "w_ovf_h1", Name: "Sender", Balance: 500, Currency: "USD"})
+	_ = repos.Wallets.CreateWallet(ctx, &domain.Wallet{ID: "w_ovf_h2", Name: "Receiver", Balance: math.MaxInt64 - 50, Currency: "USD"})
+
+	reqBody, _ := json.Marshal(service.CreateTransferRequest{
+		IdempotencyKey: "overflow_http_key_1",
+		FromWalletID:   "w_ovf_h1",
+		ToWalletID:     "w_ovf_h2",
+		Amount:         100,
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/transfers", bytes.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 Bad Request on balance overflow, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestHandler_SystemTreasury_Reconcile(t *testing.T) {
+	router := setupTestServer(t)
+
+	req := httptest.NewRequest(http.MethodGet, "/wallets/system_treasury/reconcile", nil)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK on system_treasury reconcile, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp struct {
+		WalletID      string `json:"walletId"`
+		StoredBalance int64  `json:"storedBalance"`
+		LedgerBalance int64  `json:"ledgerBalance"`
+		IsBalanced    bool   `json:"isBalanced"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to decode reconcile response: %v", err)
+	}
+
+	const treasuryOpeningBalance int64 = 100000000000000
+	if !resp.IsBalanced {
+		t.Fatalf("expected system_treasury to be balanced on startup, got %+v", resp)
+	}
+	if resp.StoredBalance != treasuryOpeningBalance || resp.LedgerBalance != treasuryOpeningBalance {
+		t.Fatalf("expected balances %d, got %+v", treasuryOpeningBalance, resp)
+	}
+}
+
+func TestHandler_Transfer_CurrencyMismatch(t *testing.T) {
+	router, repos := setupTestServerWithRepos(t)
+	ctx := context.Background()
+
+	_ = repos.Wallets.CreateWallet(ctx, &domain.Wallet{ID: "w_curr_h1", Name: "USD Wallet", Balance: 500, Currency: "USD"})
+	_ = repos.Wallets.CreateWallet(ctx, &domain.Wallet{ID: "w_curr_h2", Name: "EUR Wallet", Balance: 500, Currency: "EUR"})
+
+	reqBody, _ := json.Marshal(service.CreateTransferRequest{
+		IdempotencyKey: "curr_mismatch_http_1",
+		FromWalletID:   "w_curr_h1",
+		ToWalletID:     "w_curr_h2",
+		Amount:         100,
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/transfers", bytes.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 Bad Request on currency mismatch, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestHandler_InternalServerError_GenericMessage(t *testing.T) {
+	router, repos := setupTestServerWithRepos(t)
+	ctx := context.Background()
+
+	_ = repos.Wallets.CreateWallet(ctx, &domain.Wallet{ID: "w_ise1", Name: "W1", Balance: 500, Currency: "USD"})
+	_ = repos.Wallets.CreateWallet(ctx, &domain.Wallet{ID: "w_ise2", Name: "W2", Balance: 500, Currency: "USD"})
+
+	reqBody, _ := json.Marshal(service.CreateTransferRequest{
+		IdempotencyKey: "ise_key_1",
+		FromWalletID:   "w_ise1",
+		ToWalletID:     "w_ise2",
+		Amount:         100,
+	})
+
+	// Cancel context to force an unexpected failure in repository/database operations
+	canceledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	req := httptest.NewRequest(http.MethodPost, "/transfers", bytes.NewReader(reqBody)).WithContext(canceledCtx)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500 Internal Server Error, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var errResp handler.ErrorResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &errResp); err != nil {
+		t.Fatalf("failed to parse error response: %v", err)
+	}
+
+	if errResp.Error != "internal server error" {
+		t.Fatalf("expected stable generic error 'internal server error', got '%s'", errResp.Error)
+	}
+}
+
+func TestHandler_GetTransfer_NotFound(t *testing.T) {
+	router := setupTestServer(t)
+
+	req := httptest.NewRequest(http.MethodGet, "/transfers/non-existent-transfer-id", nil)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 Not Found, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var errResp handler.ErrorResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &errResp); err != nil {
+		t.Fatalf("failed to parse error response: %v", err)
+	}
+
+	if errResp.Error != "transfer not found" {
+		t.Fatalf("expected 'transfer not found', got '%s'", errResp.Error)
+	}
+}
+
+func TestHandler_GetTransfer_InternalServerError(t *testing.T) {
+	router := setupTestServer(t)
+
+	canceledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	req := httptest.NewRequest(http.MethodGet, "/transfers/some-id", nil).WithContext(canceledCtx)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500 Internal Server Error on operational/db failure, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var errResp handler.ErrorResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &errResp); err != nil {
+		t.Fatalf("failed to parse error response: %v", err)
+	}
+
+	if errResp.Error != "internal server error" {
+		t.Fatalf("expected stable generic error 'internal server error', got '%s'", errResp.Error)
+	}
+}
+
+func TestHandler_CreateWallet_Conflict(t *testing.T) {
+	router := setupTestServer(t)
+
+	// First creation succeeds
+	body1, _ := json.Marshal(service.CreateWalletRequest{
+		ID:             "wallet_conflict_test",
+		Name:           "Original Wallet",
+		InitialBalance: 0,
+	})
+	req1 := httptest.NewRequest(http.MethodPost, "/wallets", bytes.NewReader(body1))
+	req1.Header.Set("Content-Type", "application/json")
+	w1 := httptest.NewRecorder()
+	router.ServeHTTP(w1, req1)
+
+	if w1.Code != http.StatusCreated {
+		t.Fatalf("expected 201 Created for first wallet, got %d: %s", w1.Code, w1.Body.String())
+	}
+
+	// Second creation with identical ID returns 409 Conflict
+	body2, _ := json.Marshal(service.CreateWalletRequest{
+		ID:             "wallet_conflict_test",
+		Name:           "Duplicate Wallet",
+		InitialBalance: 0,
+	})
+	req2 := httptest.NewRequest(http.MethodPost, "/wallets", bytes.NewReader(body2))
+	req2.Header.Set("Content-Type", "application/json")
+	w2 := httptest.NewRecorder()
+	router.ServeHTTP(w2, req2)
+
+	if w2.Code != http.StatusConflict {
+		t.Fatalf("expected 409 Conflict for duplicate wallet ID, got %d: %s", w2.Code, w2.Body.String())
+	}
+}
+
+func TestHandler_CreateWallet_InternalServerError(t *testing.T) {
+	router := setupTestServer(t)
+
+	canceledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	body, _ := json.Marshal(service.CreateWalletRequest{
+		Name:           "Faulty Wallet",
+		InitialBalance: 0,
+	})
+	req := httptest.NewRequest(http.MethodPost, "/wallets", bytes.NewReader(body)).WithContext(canceledCtx)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500 Internal Server Error, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var errResp handler.ErrorResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &errResp); err != nil {
+		t.Fatalf("failed to parse error response: %v", err)
+	}
+
+	if errResp.Error != "internal server error" {
+		t.Fatalf("expected stable generic error 'internal server error', got '%s'", errResp.Error)
 	}
 }

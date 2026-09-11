@@ -2,17 +2,15 @@ package postgres
 
 import (
 	"context"
-	_ "embed"
 	"fmt"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
-)
 
-//go:embed schema.sql
-var schemaSQL string
+	"wallet-transfer-assignment/migrations"
+)
 
 // DBTX is the common interface implemented by *pgxpool.Pool and pgx.Tx.
 type DBTX interface {
@@ -50,10 +48,7 @@ func NewPool(ctx context.Context, connString string) (*pgxpool.Pool, error) {
 	return pool, nil
 }
 
-// Migrate applies the foundational schema to PostgreSQL.
+// Migrate applies the database migrations from the migrations package.
 func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
-	if _, err := pool.Exec(ctx, schemaSQL); err != nil {
-		return fmt.Errorf("failed to run database migration: %w", err)
-	}
-	return nil
+	return migrations.Migrate(ctx, pool)
 }

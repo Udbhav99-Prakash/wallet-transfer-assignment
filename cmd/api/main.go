@@ -5,8 +5,10 @@ import (
 	"errors"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -23,7 +25,12 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	log.Printf("Connecting to PostgreSQL at %s ...", cfg.DatabaseURL)
+	if parsedURL, err := url.Parse(cfg.DatabaseURL); err == nil && parsedURL.Host != "" {
+		dbName := strings.TrimPrefix(parsedURL.Path, "/")
+		log.Printf("Connecting to PostgreSQL at host=%s db=%s ...", parsedURL.Host, dbName)
+	} else {
+		log.Println("Connecting to PostgreSQL database...")
+	}
 	pool, err := postgres.NewPool(ctx, cfg.DatabaseURL)
 	if err != nil {
 		log.Fatalf("Failed to connect to database: %v", err)
@@ -47,7 +54,7 @@ func main() {
 
 	// Construct services
 	transferService := service.NewTransferService(txManager, repos)
-	walletService := service.NewWalletService(repos)
+	walletService := service.NewWalletService(txManager, repos)
 
 	// Construct handlers
 	transferHandler := handler.NewTransferHandler(transferService)

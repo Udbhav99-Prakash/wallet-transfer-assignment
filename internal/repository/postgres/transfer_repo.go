@@ -70,7 +70,7 @@ func (r *transferRepository) GetTransferByID(ctx context.Context, id string) (*d
 	)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, errors.New("transfer not found")
+			return nil, domain.ErrTransferNotFound
 		}
 		return nil, fmt.Errorf("failed to get transfer: %w", err)
 	}

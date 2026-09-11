@@ -29,8 +29,9 @@ type IdempotencyRecord struct {
 }
 
 // ComputeRequestHash creates a deterministic SHA-256 digest of transfer parameters.
+// Uses length-delimited fields to prevent delimiter-injection collisions (e.g. ("a", "b:c") vs ("a:b", "c")).
 func ComputeRequestHash(fromWalletID, toWalletID string, amount int64) string {
-	payload := fmt.Sprintf("%s:%s:%d", fromWalletID, toWalletID, amount)
+	payload := fmt.Sprintf("%d:%s:%d:%s:%d", len(fromWalletID), fromWalletID, len(toWalletID), toWalletID, amount)
 	hash := sha256.Sum256([]byte(payload))
 	return hex.EncodeToString(hash[:])
 }
