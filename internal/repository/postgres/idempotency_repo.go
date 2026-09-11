@@ -215,3 +215,19 @@ func (r *idempotencyRepository) DeleteInProgress(ctx context.Context, key string
 	}
 	return nil
 }
+
+func (r *idempotencyRepository) HeartbeatIdempotency(ctx context.Context, key string, ownerToken string) error {
+	query := `
+		UPDATE idempotency_records
+		SET updated_at = $1
+		WHERE idempotency_key = $2 AND owner_token = $3 AND status = 'IN_PROGRESS'
+	`
+	cmdTag, err := r.db.Exec(ctx, query, time.Now().UTC(), key, ownerToken)
+	if err != nil {
+		return fmt.Errorf("failed to heartbeat idempotency reservation: %w", err)
+	}
+	if cmdTag.RowsAffected() == 0 {
+		return domain.ErrIdempotencyLeaseLost
+	}
+	return nil
+}

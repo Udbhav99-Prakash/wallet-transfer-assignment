@@ -2,14 +2,49 @@ package testutil
 
 import (
 	"context"
+	"fmt"
 	"net/url"
 	"os"
+	"strings"
 	"testing"
+	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"wallet-transfer-assignment/internal/repository/postgres"
 )
+
+// ensureTestDatabaseExists creates the test database if it does not exist, protecting application databases.
+func ensureTestDatabaseExists(dbURL string) {
+	u, err := url.Parse(dbURL)
+	if err != nil {
+		return
+	}
+	dbName := strings.TrimPrefix(u.Path, "/")
+	if dbName == "" || dbName == "postgres" {
+		return
+	}
+
+	// Connect to default "postgres" administrative database
+	adminURL := *u
+	adminURL.Path = "/postgres"
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	adminPool, err := pgxpool.New(ctx, adminURL.String())
+	if err != nil {
+		return
+	}
+	defer adminPool.Close()
+
+	var exists bool
+	_ = adminPool.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = $1)", dbName).Scan(&exists)
+	if !exists {
+		_, _ = adminPool.Exec(ctx, fmt.Sprintf("CREATE DATABASE %s", pgx.Identifier{dbName}.Sanitize()))
+	}
+}
 
 // SetupTestDB initializes connection to the PostgreSQL test instance, runs migrations, and registers cleanup.
 func SetupTestDB(t *testing.T) *pgxpool.Pool {
@@ -17,10 +52,12 @@ func SetupTestDB(t *testing.T) *pgxpool.Pool {
 
 	dbURL := os.Getenv("TEST_DATABASE_URL")
 	if dbURL == "" {
-		dbURL = "postgres://postgres:postgrespassword@localhost:5432/wallet_db?sslmode=disable"
+		dbURL = "postgres://postgres:postgrespassword@localhost:5432/wallet_test_db?sslmode=disable"
 	}
 
-	sanitizedEndpoint := "localhost:5432/wallet_db"
+	ensureTestDatabaseExists(dbURL)
+
+	sanitizedEndpoint := "localhost:5432/wallet_test_db"
 	if u, parseErr := url.Parse(dbURL); parseErr == nil {
 		sanitizedEndpoint = u.Host + u.Path
 	}

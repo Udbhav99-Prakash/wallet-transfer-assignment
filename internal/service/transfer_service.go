@@ -3,11 +3,13 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 
 	"wallet-transfer-assignment/internal/domain"
 	"wallet-transfer-assignment/internal/repository"
@@ -63,7 +65,7 @@ func (s *TransferService) ExecuteTransfer(ctx context.Context, req CreateTransfe
 				cachedResp.IsReplay = true
 				cachedResp.ResponseCode = existing.ResponseCode
 				if existing.Status == domain.IdempotencyStatusFailed {
-					return &cachedResp, domain.ErrInsufficientFunds
+					return &cachedResp, s.mapFailureReasonToError(cachedResp.FailureReason, existing.ResponseCode)
 				}
 				return &cachedResp, nil
 			}
@@ -89,6 +91,29 @@ func (s *TransferService) ExecuteTransfer(ctx context.Context, req CreateTransfe
 	}
 	if req.Amount <= 0 {
 		return nil, domain.ErrInvalidAmount
+	}
+
+	// Validate wallet existence, currency compatibility, and overflow before reserving idempotency key.
+	// This ensures invalid requests fail fast without reserving or polluting idempotency records.
+	fromWalletPre, err := s.repos.Wallets.GetWalletByID(ctx, req.FromWalletID)
+	if err != nil {
+		if errors.Is(err, domain.ErrWalletNotFound) || errors.Is(err, pgx.ErrNoRows) {
+			return nil, domain.ErrWalletNotFound
+		}
+		return nil, fmt.Errorf("failed to verify source wallet: %w", err)
+	}
+	toWalletPre, err := s.repos.Wallets.GetWalletByID(ctx, req.ToWalletID)
+	if err != nil {
+		if errors.Is(err, domain.ErrWalletNotFound) || errors.Is(err, pgx.ErrNoRows) {
+			return nil, domain.ErrWalletNotFound
+		}
+		return nil, fmt.Errorf("failed to verify destination wallet: %w", err)
+	}
+	if fromWalletPre.Currency != toWalletPre.Currency {
+		return nil, domain.ErrCurrencyMismatch
+	}
+	if !toWalletPre.CanCredit(req.Amount) {
+		return nil, domain.ErrBalanceOverflow
 	}
 
 	// 4. Short committed reservation outside the transfer transaction.
@@ -135,8 +160,32 @@ func (s *TransferService) ExecuteTransfer(ctx context.Context, req CreateTransfe
 		return nil, domain.ErrIdempotencyConflict
 	}
 
+	// Start background lease heartbeat to refresh updated_at while the transaction is actively executing.
+	// This prevents a live but slow transaction from being reclaimed prematurely by stale-owner recovery.
+	stopHeartbeat := make(chan struct{})
+	heartbeatDone := make(chan struct{})
+	go func() {
+		defer close(heartbeatDone)
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stopHeartbeat:
+				return
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				_ = s.repos.Idempotency.HeartbeatIdempotency(ctx, req.IdempotencyKey, ownerToken)
+			}
+		}
+	}()
+	defer func() {
+		close(stopHeartbeat)
+		<-heartbeatDone
+	}()
+
 	// The caller owns the reservation.
-	// If the transfer execution fails unexpectedly (e.g. context cancellation, DB connection drop, commit failure),
+	// If the transfer execution aborts unexpectedly (e.g. context cancellation, DB connection drop, panic),
 	// delete the in-progress reservation so subsequent retries do not have to wait for stale timeout.
 	success := false
 	defer func() {
@@ -147,12 +196,11 @@ func (s *TransferService) ExecuteTransfer(ctx context.Context, req CreateTransfe
 		}
 	}()
 
-	// 3. Execute transfer inside transaction
+	// 5. Execute transfer inside transaction
 	var finalResponse *TransferResponse
 	var isInsufficientFunds bool
 
 	txErr := s.txManager.ExecuteInTx(ctx, func(txRepos repository.Repositories) error {
-
 		// Deterministic lock ordering to prevent deadlocks:
 		// Always acquire locks in alphabetical order: min(fromID, toID) followed by max(fromID, toID)
 		firstID, secondID := req.FromWalletID, req.ToWalletID
@@ -162,10 +210,16 @@ func (s *TransferService) ExecuteTransfer(ctx context.Context, req CreateTransfe
 
 		wallet1, lockErr1 := txRepos.Wallets.GetWalletByIDForUpdate(ctx, firstID)
 		if lockErr1 != nil {
+			if errors.Is(lockErr1, domain.ErrWalletNotFound) || errors.Is(lockErr1, pgx.ErrNoRows) {
+				return domain.ErrWalletNotFound
+			}
 			return lockErr1
 		}
 		wallet2, lockErr2 := txRepos.Wallets.GetWalletByIDForUpdate(ctx, secondID)
 		if lockErr2 != nil {
+			if errors.Is(lockErr2, domain.ErrWalletNotFound) || errors.Is(lockErr2, pgx.ErrNoRows) {
+				return domain.ErrWalletNotFound
+			}
 			return lockErr2
 		}
 
@@ -179,6 +233,11 @@ func (s *TransferService) ExecuteTransfer(ctx context.Context, req CreateTransfe
 		// Reject transfers between wallets with mismatched currencies
 		if fromWallet.Currency != toWallet.Currency {
 			return domain.ErrCurrencyMismatch
+		}
+
+		// Reject transfers where crediting destination would overflow MaxInt64
+		if !toWallet.CanCredit(req.Amount) {
+			return domain.ErrBalanceOverflow
 		}
 
 		// Initialize transfer record with PENDING state
@@ -225,6 +284,7 @@ func (s *TransferService) ExecuteTransfer(ctx context.Context, req CreateTransfe
 			record.TransferID = &transfer.ID
 			record.ResponseCode = http.StatusUnprocessableEntity
 			record.ResponseBody = string(respBytes)
+			record.OwnerToken = ownerToken
 			if updateErr := txRepos.Idempotency.UpdateIdempotency(ctx, record); updateErr != nil {
 				return updateErr
 			}
@@ -280,7 +340,7 @@ func (s *TransferService) ExecuteTransfer(ctx context.Context, req CreateTransfe
 		}
 		respBytes, jsonErr := json.Marshal(resp)
 		if jsonErr != nil {
-			return fmt.Errorf("failed to marshal success response: %w", jsonErr)
+			return fmt.Errorf("failed to marshal transfer response: %w", jsonErr)
 		}
 
 		record.Status = domain.IdempotencyStatusCompleted
@@ -308,6 +368,31 @@ func (s *TransferService) ExecuteTransfer(ctx context.Context, req CreateTransfe
 	}
 
 	return finalResponse, nil
+}
+
+func (s *TransferService) mapFailureReasonToError(reason *string, code int) error {
+	if reason != nil {
+		switch *reason {
+		case "wallet not found":
+			return domain.ErrWalletNotFound
+		case domain.ErrCurrencyMismatch.Error():
+			return domain.ErrCurrencyMismatch
+		case domain.ErrBalanceOverflow.Error():
+			return domain.ErrBalanceOverflow
+		case "insufficient funds in source wallet":
+			return domain.ErrInsufficientFunds
+		}
+	}
+	switch code {
+	case http.StatusNotFound:
+		return domain.ErrWalletNotFound
+	case http.StatusBadRequest:
+		return errors.New("bad request")
+	case http.StatusUnprocessableEntity:
+		return domain.ErrInsufficientFunds
+	default:
+		return errors.New("transfer failed")
+	}
 }
 
 // GetTransfer retrieves transfer details by ID.

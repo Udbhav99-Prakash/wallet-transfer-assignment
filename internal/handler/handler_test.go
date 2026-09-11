@@ -605,3 +605,18 @@ func TestHandler_Transfer_IdempotencyKeyTooLong(t *testing.T) {
 		t.Fatalf("expected 400 Bad Request for key > 128 chars, got %d: %s", w.Code, w.Body.String())
 	}
 }
+
+func TestHandler_Transfer_UnsupportedMediaType(t *testing.T) {
+	router := setupTestServer(t)
+
+	reqBody := []byte(`{"idempotencyKey":"key_xml","fromWalletId":"w1","toWalletId":"w2","amount":100}`)
+
+	req := httptest.NewRequest(http.MethodPost, "/transfers", bytes.NewReader(reqBody))
+	req.Header.Set("Content-Type", "text/plain")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnsupportedMediaType {
+		t.Fatalf("expected 415 Unsupported Media Type for text/plain, got %d: %s", w.Code, w.Body.String())
+	}
+}

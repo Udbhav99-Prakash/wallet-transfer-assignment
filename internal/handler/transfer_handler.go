@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log"
+	"mime"
 	"net/http"
 
 	"wallet-transfer-assignment/internal/domain"
@@ -20,8 +21,12 @@ func NewTransferHandler(transferService *service.TransferService) *TransferHandl
 
 // CreateTransfer handles POST /transfers
 func (h *TransferHandler) CreateTransfer(w http.ResponseWriter, r *http.Request) {
-	if r.Header.Get("Content-Type") != "application/json" && r.Header.Get("Content-Type") != "" {
-		// Allow standard JSON
+	if ct := r.Header.Get("Content-Type"); ct != "" {
+		mediaType, _, err := mime.ParseMediaType(ct)
+		if err != nil || mediaType != "application/json" {
+			WriteError(w, http.StatusUnsupportedMediaType, "Content-Type must be application/json")
+			return
+		}
 	}
 
 	var req service.CreateTransferRequest

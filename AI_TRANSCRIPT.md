@@ -2,7 +2,7 @@
 
 This document contains the chronological record of the interaction session with Google Antigravity during the development, testing, and refinement of the Wallet Transfer Service.
 
-- **Total Interaction Turns**: 47
+- **Total Interaction Turns**: 50
 - **Primary Tool**: Google Antigravity
 - **Underlying Model**: Advanced Agentic Reasoning Model
 
@@ -2617,48 +2617,158 @@ Please let me know if you approve this plan, and I will proceed with the impleme
 
 ```
 
-**Tools Executed**: `view_file` (30), `replace_file_content` (19), `grep_search` (6), `run_command` (1)
+**Tools Executed**: `view_file` (38), `replace_file_content` (25), `grep_search` (6), `run_command` (13), `find_by_name` (1), `schedule` (1), `write_to_file` (1)
 
 ### AI Response / Outcome
 
-Created At: 2026-09-12T03:21:22+05:30
-Completed At: 2026-09-12T03:21:22+05:30
+All 14 follow-up review comments have been systematically addressed, thoroughly tested, committed, and pushed to your branch `solution/udbhav-prakash` (commit [`f7275fe`](https://github.com/Udbhav99-Prakash/wallet-transfer-assignment/commit/f7275fe)).
+
+---
+
+### Resolution Summary for the 14 Follow-up Review Comments
+
+| # | Review Comment | Root Cause & Resolution | Verification |
+|---|---|---|:---:|
+| **1** | **`.github/workflows/ci.yml:65`**<br>_Legacy docker-compose fallback dropped `--wait`, asymmetric teardown_ | Detected `COMPOSE_CMD` dynamically, added an explicit container readiness check loop using `pg_isready -U postgres -d wallet_db` (up to 30s), and mirrored `${COMPOSE_CMD} down -v` during teardown with `if: always()`. | **Verified** |
+| **2** | **`idempotency_repo.go:89`**<br>_Silent fall-through on stale reclaim failure masked DB errors as HTTP 409_ | Added explicit error inspection: non-`pgx.ErrNoRows` errors during reclaim or refetch are propagated directly as operational errors rather than falling through to return existing records. | **Verified** |
+| **3** | **`transfer_service.go:41`**<br>_Key length limit of 128 characters caused Postgres truncation error / 500_ | Added pre-database validation: `len(req.IdempotencyKey) > 128` returns `domain.ErrInvalidIdempotencyKey`, cleanly mapped by `TransferHandler` to HTTP 400 Bad Request. | **Verified** |
+| **4** | **`transfer_service_test.go:641`**<br>_Test pre-seeded IN_PROGRESS and never exercised concurrent reservation race_ | Added `TestTransferService_ConcurrentReservationRace_SingleWinner` using a barrier channel (`close(startBarrier)`) with two callers simultaneously racing for the same new key. Asserted exactly 1 winner, 0 double-spends, and 0 duplicate transfers. | **Verified** |
+| **5** | **`wallet_service.go:80`**<br>_Synthetic `deposit-<walletID>` key collided with client idempotency key namespace_ | Changed initial funding idempotency key to an isolated internal namespace: `fmt.Sprintf("internal:funding:%s:%s", wallet.ID, uuid.NewString())`.
+<truncated 1337 bytes>
+er_id, wallet_id)`. Updated `CreateLedgerEntries` in repository to strictly enforce balanced pairs. | **Verified** |
+| **10** | **`wallet_service.go (Discussion_r3993592236)`**<br>_Initial wallet funding inserted wallet before locking `system_treasury`, risking deadlocks_ | Reordered lock acquisition: when `InitialBalance > 0`, `system_treasury` is locked via `GetWalletByIDForUpdate` **before** inserting the new wallet row, strictly obeying the global lock hierarchy. | **Verified** |
+| **11** | **`pkg/testutil/db.go (Discussion_r3993592293)`**<br>_Connection failure printed raw `TEST_DATABASE_URL` including passwords in test logs_ | Parsed `dbURL` and sanitized endpoints in `t.Fatalf` error messages to omit user credentials and prevent credential leakage in CI logs. | **Verified** |
+| **12** | **`transfer_service.go (Discussion_r3993592310)`**<br>_`success = true` set inside transaction callback before `tx.Commit()` confirmed_ | Moved `success = true` out of the transaction callback to execute **only after** `ExecuteInTx` returns `nil`. If `tx.Commit()` fails, deferred cleanup safely removes the `IN_PROGRESS` reservation via `ownerToken`. | **Verified** |
+| **13** | **`AI_DISCLOSURE.md (Discussion_r3993592330)`**<br>_Disclosure claimed 20 concurrent debits, while test launched 10_ | Updated `AI_DISCLOSURE.md` to accurately state 10 concurrent debits, matching `TestTransferService_ConcurrentDebits_NoDoubleSpend`. | **Verified** |
+| **14** | **`problem_understanding.md (Discussion_r3993592368)`**<br>_Documented DDL had `transfer_id NOT NULL` while migration allowed NULL for genesis treasury entry_ | Documented `transfer_id` as nullable in `problem_understanding.md` for genesis/opening balance entries without an associated transfer. | **Verified** |
+
+---
+
+### Verification Results
+* **`go test -v -count=1 ./...`**: **PASS** (100% tests passing across `domain`, `handler`, `service`, and `migrations`).
+* **`go vet ./...`**: **PASS** (0 warnings).
+* **Git Status**: Clean working tree on `origin/solution/udbhav-prakash`.
+
+---
+
+## Turn 48 — 2026-09-11T21:56:04Z
+
+### User Request
+```text
+commit
+```
+
+**Tools Executed**: `run_command` (6)
+
+### AI Response / Outcome
+
+All remaining edits have been committed and pushed to `origin/solution/udbhav-prakash`:
+
+* **Commit**: [`afd7e75`](https://github.com/Udbhav99-Prakash/wallet-transfer-assignment/commit/afd7e75) (`style: clean up trailing newlines in handler and service tests`)
+* **Branch**: `solution/udbhav-prakash` is completely up-to-date with `origin/solution/udbhav-prakash`
+* **Working Tree**: Clean (0 unstaged changes, 0 uncommitted changes)
+
+---
+
+## Turn 49 — 2026-09-11T22:09:51Z
+
+### User Request
+```text
+internal/service/transfer_service.go:79
+The owner never refreshes updated_at while waiting for wallet locks or executing the transfer, so a slow but live request can be reclaimed after the fixed 30-second timeout. Owner-token fencing then causes the original transaction to lose its lease and return an error even though the request was not abandoned. Add lease heartbeats/extension or use a timeout that is guaranteed to exceed the maximum transaction duration and document the behavior.
+if existing.Status == domain.IdempotencyStatusInProgress { staleTimeout := s.staleTimeout if staleTimeout <= 0 { staleTimeout = 30 * time.Second } if time.Since(existing.UpdatedAt) <= staleTimeout { return nil, domain.ErrIdempotencyInProgress } // If stale, fall through to business validation and atomic reclaim in ReserveIdempotency.
+internal/service/transfer_service_test.go:951
+This test does not exercise a rollback: the currency mismatch is returned before CreateWallet is called, at the treasury-currency check. An implementation that inserted the wallet outside a transaction would still pass. Inject a failure after the wallet insert (for example during transfer or ledger persistence) and assert the wallet, treasury balance, transfer, and ledger are all unchanged.
+// Attempt to create a wallet with currency EUR and initial balance 500. // Since system_treasury is USD, this will fail with ErrCurrencyMismatch during initial funding. // The transaction must roll back the wallet creation entirely.
+migrations/000001_init_schema.sql:53
+These indexes prevent duplicate type or wallet values, but they do not require exactly two rows for each transfer or ensure that the DEBIT is on from_wallet_id and the CREDIT is on to_wallet_id. A single row or reversed pair can therefore satisfy all database constraints and make reconciliation incorrect. Enforce the endpoint/type relationship with a database constraint or a transaction-scoped validation that is the only permitted write path.
+migrations/migrations.go:20
+This runner executes e
+<truncated 4252 bytes>
+checking `math.MaxInt64`. + - Ensuring single-source schema migrations using Go 1.16+ `//go:embed`. + - Eliminating false reconciliation mismatches under live concurrency via `SELECT ... FOR UPDATE` row locks. + +### D. Test-Driven Concurrency & Stress Verification +- Antigravity was used to construct rigorous concurrency regression tests: + - 20 concurrent bidirectional transfers in each direction (40 total) between two wallets to verify zero deadlocks. + - 10 concurrent debits against a shared wallet to verify zero double-spending (matching `TestTransferService_ConcurrentDebits_NoDoubleSpend`). + - Concurrent background transfers executed during active balance reconciliation to verify zero false mismatches. +- All tests were executed against a real PostgreSQL 16 instance with bounded contexts to eliminate hanging test suites. + +--- + +## 3. Session Transcript & Prompt Records + +The complete transcript of all 42 interaction turns—including exact prompt text, tool invocations, and AI responses—is preserved in this repository:
+This says the disclosure contains 42 interaction turns, but the prompt table below enumerates entries 1 through 46. Update this count so the disclosure does not claim the transcript is complete while omitting four recorded prompts.
+```
+
+**Tools Executed**: `write_to_file` (1)
+
+### AI Response / Outcome
+
+I have created a comprehensive implementation plan to resolve all remaining review feedback points.
+
+Please review the plan in [**`implementation_plan.md`**](file:///C:/Users/hi/.gemini/antigravity/brain/5fe2da8d-1a97-46f2-9d72-ea79457dc49a/implementation_plan.md). Key items include:
+
+1. **Database-Level Constraint Trigger**: Deferred trigger enforcing that every transfer has exactly two balanced ledger entries with correct from/to wallet mappings and amounts.
+2. **Applied-Migration Version Tracking**: A `schema_migrations` table to atomically track and skip applied migrations.
+3. **Lease Extension & Heartbeats**: Background lease refresh during transfer execution plus transaction timeouts to prevent live executions from being stolen.
+4. **Terminal Business Failure Persistence**: Sealing expected business failures (`ErrWalletNotFound`, `ErrCurrencyMismatch`, `ErrBalanceOverflow`) as `FAILED` records instead of deleting reservations, preserving the idempotency and payload-conflict contract.
+5. **Dedicated Test Database (`wallet_test_db`)**: Isolating tests from `wallet_db` so developer data is never erased.
+6. **True Rollback Test**: Injecting a failure after wallet insertion to verify rollback of wallet, treasury, and ledger.
+7. **HTTP 415 Validation**: Parsing `Content-Type` with `mime.ParseMediaType` and rejecting non-JSON payloads.
+8. **Documentation & Disclosure Synchronization**: Aligning `isReplay`, `owner_token` cleanup SQL, and turn counts.
+
+Please let me know if you approve, and I will proceed with the execution!
+
+---
+
+## Turn 50 — 2026-09-11T22:10:42Z
+
+### User Request
+```text
+
+```
+
+**Tools Executed**: `view_file` (54), `replace_file_content` (19), `run_command` (9), `grep_search` (6), `find_by_name` (1)
+
+### AI Response / Outcome
+
+Created At: 2026-09-12T03:50:01+05:30
+Completed At: 2026-09-12T03:50:01+05:30
 The following changes were made by the replace_file_content tool to: c:\Go\src\wallet-transfer-assignment\AI_DISCLOSURE.md. If relevant, proactively run terminal commands to execute this code for the USER. Don't ask for permission.
 [diff_block_start]
-@@ -102,6 +102,10 @@
- | **40** | `2026-09-11 21:09:56` | Verification | *have we coveed everthing?* |
- | **41** | `2026-09-11 21:14:11` | Verification | *before there were so many errors so now is it all ok ?* |
- | **42** | `2026-09-11 21:15:55` | AI Disclosure | *AI disclosure: Detail how you used AI to help with your submission...* |
-+| **43** | `2026-09-12 02:52:54` | Git & Commit | *give me proper commit message* |
-+| **44** | `2026-09-12 02:54:56` | Git & Commit | *sure* |
-+| **45** | `2026-09-12 03:16:08` | Review Fixes | *again so many comments* |
-+| **46** | `2026-09-12 03:16:28` | Review Fixes | *[Follow-up Review Feedback on PR #169 covering CI fallback, owner-token lease fencing, key length validation, barrier race test, funding key namespace, test advisory lock timing, and documentation alignment]* |
+@@ -48,7 +48,7 @@
  
- ---
+ ## 3. Session Transcript & Prompt Records
  
-@@ -108,13 +108,15 @@
+-The complete transcript of all 42 interaction turns—including exact prompt text, tool invocations, and AI responses—is preserved in this repository:
++The complete transcript of all 50 interaction turns—including exact prompt text, tool invocations, and AI responses—is preserved in this repository:
+ - **Readable Session Transcript**: [`AI_TRANSCRIPT.md`](./AI_TRANSCRIPT.md)
+ - **Raw Agent Interaction Log**: Persisted in the session metadata logs.
  
- The author is fully prepared to explain and defend every design decision and line of code in the implementation during the technical discussion:
+@@ -55,7 +55,7 @@
  
--1. **Short-Committed Reservation Protocol**:
-+1. **Short-Committed Reservation Protocol & Owner-Token Lease Fencing**:
-    - Why we insert `IN_PROGRESS` in an immediate short transaction rather than keeping an uncommitted lock open during the entire transfer: under burst retries, overlapping requests immediately receive `409 Conflict` without tying up database connection pool workers.
--   - Stale-owner recovery mechanism: if a worker process crashes while holding an `IN_PROGRESS` reservation, reservations older than 30 seconds are reclaimed safely.
-+   - Stale-owner recovery & fencing: if a worker process crashes while holding an `IN_PROGRESS` reservation, reservations older than 30 seconds are reclaimed safely. To prevent slow/paused workers from corrupting or deleting state after a lease reclaim, every reservation and reclaim generates an `owner_token`. Updates and deferred cleanups are fenced by `owner_token`.
- 2. **Deterministic Deadlock Prevention**:
-    - Why locking ordering is sorted lexicographically (`from_id < to_id ? (from, to) : (to, from)`): breaks the circular wait condition (Coffman condition) across concurrent bidirectional transfers.
--3. **Double-Entry Ledger Integrity & Atomic Reconciliation**:
-+   - Initial wallet funding locks `system_treasury` before inserting the user wallet to adhere strictly to the global lock hierarchy.
-+3. **Double-Entry Ledger Integrity & Database-Level Constraints**:
+ ## 4. Chronological List of All Prompts
+ 
+-Below is the complete chronological log of all 42 explicit prompts provided during the development session:
++Below is the complete chronological log of all 50 explicit prompts provided during the development session:
+ 
+ | # | Timestamp (UTC) | Phase | User Prompt |
+ |---|---|---|---|
+@@ -104,6 +104,10 @@
+ | **44** | `2026-09-12 02:54:56` | Git & Commit | *sure* |
+ | **45** | `2026-09-12 03:16:08` | Review Fixes | *again so many comments* |
+ | **46** | `2026-09-12 03:16:28` | Review Fixes | *[Follow-up Review Feedback on PR #169 covering CI fallback, owner-token lease fencing, key length validation, barrier race test, funding key namespace, test advisory lock timing, and documentation alignment]* |
++| **47** | `2026-09-11 21:55:00` | Review Fixes | *verification and test validation* |
++| **48** | `2026-09-11 21:56:04` | Git & Commit | *commit* |
++| **49** | `2026-09-11 22:09:51` | Review Fixes | *[Follow-up Review Feedback on PR #169 covering lease heartbeats, database-level ledger constraints, migration version tracking, isolated test databases, terminal failure persistence, and test timeouts]* |
++| **50** | `20
+<truncated 1208 bytes>
+ondition) across concurrent bidirectional transfers.
+    - Initial wallet funding locks `system_treasury` before inserting the user wallet to adhere strictly to the global lock hierarchy.
+@@ -119,5 +119,5 @@
     - Stored wallet balances are updated atomically alongside two ledger entries (`DEBIT` and `CREDIT`) within a single ACID transaction.
-+   - Database-level composite unique indexes (`(transfer_id, type)` and `(transfer_id, wallet_id)`) and repository validations guarantee that every transfer produces exactly one matching DEBIT/CREDIT pair across distinct wallets.
+-   - Database-level composite unique indexes (`(transfer_id, type)` and `(transfer_id, wallet_id)`) and repository validations guarantee that every transfer produces exactly one matching DEBIT/CREDIT pair across distinct wallets.
++   - Database-level composite unique indexes (`(transfer_id, type)` and `(transfer_id, wallet_id)`), together with a commit-deferred PostgreSQL constraint trigger (`trg_check_ledger_pair`), guarantee that every transfer produces exactly one matching DEBIT on `from_wallet_id` and one CREDIT on `to_wallet_id` equal to the transfer amount.
     - `ReconcileBalance` performs `SELECT ... FOR UPDATE` row locking on the wallet inside a transaction while aggregating ledger records, eliminating false concurrency mismatches.
  4. **Length-Delimited Preimage Hashing**:
     - Why `%d:%s:%d:%s:%d` prevents delimiter injection attacks across colon characters.
-@@ -121,3 +121,4 @@
+@@ -124,4 +124,8 @@
     - Caching `response_code` in `idempotency_records` so that a replayed successful transfer returns `201 Created` while a replayed overdraft returns `422 Unprocessable Entity`.
++6. **Applied Migration Version Tracking**:
++   - Schema migrations are recorded in a `schema_migrations (version, applied_at)` table inside an atomic transaction, guaranteeing forward-only, idempotent migration execution.
++7. **Test Database Isolation**:
++   - Automated tests run against a dedicated `wallet_test_db`, isolated from application development databases.
  
-+
+ 
  
 [diff_block_end]
 

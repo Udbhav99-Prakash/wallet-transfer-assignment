@@ -38,6 +38,7 @@ type IdempotencyRepository interface {
 	UpdateIdempotency(ctx context.Context, record *domain.IdempotencyRecord) error
 	DeleteIdempotency(ctx context.Context, key string) error
 	DeleteInProgress(ctx context.Context, key string, ownerToken string) error
+	HeartbeatIdempotency(ctx context.Context, key string, ownerToken string) error
 }
 
 // Repositories aggregates all repository interfaces.

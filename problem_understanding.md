@@ -114,23 +114,29 @@ To guarantee safe retries across network drops and client retransmissions:
      2. **Short Committed Reservation**:
         - Execute a standalone atomic `INSERT INTO idempotency_records ... ON CONFLICT DO NOTHING` committed immediately *outside* the transfer transaction.
         - Overlapping concurrent requests immediately observe the committed `IN_PROGRESS` status and return `409 Conflict` (`ErrIdempotencyInProgress`) without waiting or exhausting pool connections.
-     3. **Atomic Stale-Owner Recovery**:
-        - If an `IN_PROGRESS` record's `updated_at` is older than `stale_timeout` (e.g. 30 seconds, indicating a crashed node or abandoned request), a new request atomically reclaims ownership via compare-and-swap:
-          ```sql
-          UPDATE idempotency_records
-          SET request_hash = $1, status = 'IN_PROGRESS', updated_at = $2
-          WHERE idempotency_key = $3 AND status = 'IN_PROGRESS' AND updated_at <= $4
-          RETURNING idempotency_key;
-          ```
-     4. **Deferred Cleanup on Unexpected Abort**:
-        - If execution fails unexpectedly before reaching a terminal state (`COMPLETED` or `FAILED`), a deferred hook calls `DELETE FROM idempotency_records WHERE idempotency_key = $1 AND status = 'IN_PROGRESS'`, freeing the key for immediate retry.
-     5. **Atomic Finalization**:
-        - The transfer transaction updates the idempotency record to `COMPLETED` (HTTP 200/201) or `FAILED` (HTTP 422) atomically with wallet balances and ledger entries.
-   - **Duplicate Arrival (Existing Key, Identical Payload)**:
-     - If record status is `COMPLETED` or `FAILED`: immediately return the cached `response_code` and `response_body` with `is_replay: true`. Zero side effects triggered.
-     - If record status is `IN_PROGRESS`: another request with the same key is currently running. Return `409 Conflict` (`ErrIdempotencyInProgress`) immediately.
-   - **Key Collision (Existing Key, Different Payload)**:
-     - If `request_hash` does not match the stored hash: return `409 Conflict` (`ErrIdempotencyConflict`) with message: `"idempotency key reused with different request payload"`.
+      3. **Atomic Stale-Owner Recovery & Background Heartbeat**:
+         - While a transfer executes, a background heartbeat periodically refreshes `updated_at` (every 5 seconds) to prevent active long-running transactions from being reclaimed.
+         - If an `IN_PROGRESS` record's `updated_at` is older than `stale_timeout` (e.g. 30 seconds, indicating a crashed node or abandoned request), a new request atomically reclaims ownership via compare-and-swap with a unique `owner_token`:
+           ```sql
+           UPDATE idempotency_records
+           SET request_hash = $1, owner_token = $2, status = 'IN_PROGRESS', updated_at = $3
+           WHERE idempotency_key = $4 AND status = 'IN_PROGRESS' AND updated_at <= $5
+           RETURNING idempotency_key;
+           ```
+      4. **Deferred Cleanup on Unexpected Abort**:
+         - If execution aborts unexpectedly (e.g. context cancellation, network disconnection) before reaching a terminal state (`COMPLETED` or `FAILED`), a deferred cleanup hook calls:
+           ```sql
+           DELETE FROM idempotency_records 
+           WHERE idempotency_key = $1 AND owner_token = $2 AND status = 'IN_PROGRESS';
+           ```
+           Including `owner_token = $2` prevents an old worker that was reclaimed after a timeout from deleting a newer worker's active reservation.
+      5. **Atomic Finalization**:
+         - The transfer transaction updates the idempotency record to `COMPLETED` (HTTP 200/201) or `FAILED` (HTTP 422 for insufficient funds) atomically with wallet balances and ledger entries.
+    - **Duplicate Arrival (Existing Key, Identical Payload)**:
+      - If record status is `COMPLETED` or `FAILED`: immediately return the cached `response_code` and `response_body` with `isReplay: true`. Zero side effects triggered.
+      - If record status is `IN_PROGRESS`: another request with the same key is currently running. Return `409 Conflict` (`ErrIdempotencyInProgress`) immediately.
+    - **Key Collision (Existing Key, Different Payload)**:
+      - If `request_hash` does not match the stored hash: return `409 Conflict` (`ErrIdempotencyConflict`) with message: `"idempotency key reused with different request payload"`.
 
 ---
 
@@ -207,7 +213,49 @@ CREATE INDEX idx_ledger_wallet ON ledger_entries(wallet_id);
 CREATE INDEX idx_ledger_transfer ON ledger_entries(transfer_id);
 CREATE UNIQUE INDEX idx_ledger_entries_transfer_type ON ledger_entries (transfer_id, type) WHERE transfer_id IS NOT NULL;
 CREATE UNIQUE INDEX idx_ledger_entries_transfer_wallet ON ledger_entries (transfer_id, wallet_id) WHERE transfer_id IS NOT NULL;
+
+-- Database-level constraint trigger enforcing that every transfer has exactly two balanced entries:
+-- exactly one DEBIT on from_wallet_id and one CREDIT on to_wallet_id, matching transfer amount.
+CREATE OR REPLACE FUNCTION check_ledger_pair_integrity()
+RETURNS TRIGGER AS $$
+DECLARE
+    transfer_rec RECORD;
+    debit_count INT;
+    credit_count INT;
+    debit_sum BIGINT;
+    credit_sum BIGINT;
+BEGIN
+    IF NEW.transfer_id IS NOT NULL THEN
+        SELECT * INTO transfer_rec FROM transfers WHERE id = NEW.transfer_id;
+        IF FOUND THEN
+            SELECT COUNT(*), COALESCE(SUM(amount), 0) INTO debit_count, debit_sum
+            FROM ledger_entries
+            WHERE transfer_id = NEW.transfer_id AND type = 'DEBIT' AND wallet_id = transfer_rec.from_wallet_id;
+
+            SELECT COUNT(*), COALESCE(SUM(amount), 0) INTO credit_count, credit_sum
+            FROM ledger_entries
+            WHERE transfer_id = NEW.transfer_id AND type = 'CREDIT' AND wallet_id = transfer_rec.to_wallet_id;
+
+            IF debit_count <> 1 OR credit_count <> 1 OR debit_sum <> transfer_rec.amount OR credit_sum <> transfer_rec.amount THEN
+                RAISE EXCEPTION 'invalid ledger pair for transfer %: must have exactly 1 DEBIT on from_wallet and 1 CREDIT on to_wallet matching transfer amount', NEW.transfer_id;
+            END IF;
+        END IF;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE CONSTRAINT TRIGGER trg_check_ledger_pair
+AFTER INSERT OR UPDATE ON ledger_entries
+DEFERRABLE INITIALLY DEFERRED
+FOR EACH ROW
+EXECUTE FUNCTION check_ledger_pair_integrity();
 ```
+
+> **Note on Double-Entry Ledger Enforcement Boundaries**:
+> Ledger integrity is protected at two complementary boundaries:
+> 1. **Application & Transaction Boundary**: The service and repository layers strictly create ledger entries in balanced atomic pairs via `domain.NewDoubleEntryPair(transferID, fromID, toID, amount)` and `repos.Ledger.CreateLedgerEntries(ctx, debit, credit)` within the transfer transaction.
+> 2. **Database Constraint Trigger Boundary**: PostgreSQL constraint trigger `trg_check_ledger_pair` (deferred to transaction commit) independently validates at the database level that every transfer has exactly one DEBIT on `from_wallet_id` and one CREDIT on `to_wallet_id` with matching sums, rejecting any unbalanced or reversed inserts.
 
 > **Note on Money Representation**: All monetary values are represented as `BIGINT` representing minor currency units (e.g. cents) to avoid IEEE 754 floating-point rounding errors.
 >

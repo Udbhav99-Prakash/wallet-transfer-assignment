@@ -21,6 +21,12 @@ import (
 
 func setupServicesWithRepos(t *testing.T) (*service.TransferService, *service.WalletService, repository.Repositories) {
 	t.Helper()
+	transferSvc, walletSvc, _, repos := setupServicesWithTxManager(t)
+	return transferSvc, walletSvc, repos
+}
+
+func setupServicesWithTxManager(t *testing.T) (*service.TransferService, *service.WalletService, repository.TxManager, repository.Repositories) {
+	t.Helper()
 	pool := testutil.SetupTestDB(t)
 
 	repos := repository.Repositories{
@@ -34,7 +40,26 @@ func setupServicesWithRepos(t *testing.T) (*service.TransferService, *service.Wa
 	transferService := service.NewTransferService(txManager, repos)
 	walletService := service.NewWalletService(txManager, repos)
 
-	return transferService, walletService, repos
+	return transferService, walletService, txManager, repos
+}
+
+type failingLedgerTxManager struct {
+	realTxManager repository.TxManager
+}
+
+type failingLedgerRepo struct {
+	repository.LedgerRepository
+}
+
+func (f *failingLedgerRepo) CreateLedgerEntries(ctx context.Context, entries ...domain.LedgerEntry) error {
+	return errors.New("simulated ledger persistence failure after wallet insertion")
+}
+
+func (m *failingLedgerTxManager) ExecuteInTx(ctx context.Context, fn func(txRepos repository.Repositories) error) error {
+	return m.realTxManager.ExecuteInTx(ctx, func(txRepos repository.Repositories) error {
+		txRepos.Ledger = &failingLedgerRepo{LedgerRepository: txRepos.Ledger}
+		return fn(txRepos)
+	})
 }
 
 func setupServices(t *testing.T) (*service.TransferService, *service.WalletService) {
@@ -943,33 +968,58 @@ func TestTransferService_CurrencyMismatch(t *testing.T) {
 }
 
 func TestWalletService_CreateWallet_TransactionalRollback(t *testing.T) {
-	ctx := context.Background()
-	_, walletSvc, repos := setupServicesWithRepos(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_, walletSvc, txManager, repos := setupServicesWithTxManager(t)
 
-	// Attempt to create a wallet with currency EUR and initial balance 500.
-	// Since system_treasury is USD, this will fail with ErrCurrencyMismatch during initial funding.
-	// The transaction must roll back the wallet creation entirely.
-	failedID := "w_atomic_rollback_test"
-	_, err := walletSvc.CreateWallet(ctx, service.CreateWalletRequest{
+	// Obtain initial treasury balance
+	treasuryBefore, err := repos.Wallets.GetWalletByID(ctx, "system_treasury")
+	if err != nil {
+		t.Fatalf("failed to fetch system treasury: %v", err)
+	}
+
+	// Inject a failure AFTER wallet insert by decorating TxManager to fail during ledger persistence.
+	// This proves that even after the wallet row is inserted and treasury is debited, a subsequent
+	// failure cleanly rolls back the entire transaction.
+	failingTxMgr := &failingLedgerTxManager{realTxManager: txManager}
+	failingWalletSvc := service.NewWalletService(failingTxMgr, repos)
+
+	failedID := "w_atomic_rollback_" + uuid.NewString()[:8]
+	_, err = failingWalletSvc.CreateWallet(ctx, service.CreateWalletRequest{
 		ID:             failedID,
-		Name:           "EUR User",
+		Name:           "Rollback User",
 		InitialBalance: 500,
-		Currency:       "EUR",
+		Currency:       "USD",
 	})
 	if err == nil {
-		t.Fatalf("expected error creating cross-currency funded wallet, got nil")
-	}
-	if !errors.Is(err, domain.ErrCurrencyMismatch) {
-		t.Fatalf("expected ErrCurrencyMismatch, got %v", err)
+		t.Fatalf("expected error creating wallet with failing ledger persistence, got nil")
 	}
 
-	// Verify wallet row was NOT committed
+	// 1. Verify wallet row was NOT committed (rolled back)
 	w, err := repos.Wallets.GetWalletByID(ctx, failedID)
 	if err == nil || !errors.Is(err, domain.ErrWalletNotFound) {
 		t.Fatalf("expected wallet to not exist after rollback, got %v (wallet: %+v)", err, w)
 	}
 
-	// Verify the same ID can now be created cleanly with valid parameters
+	// 2. Verify treasury balance was NOT modified (rolled back)
+	treasuryAfter, err := repos.Wallets.GetWalletByID(ctx, "system_treasury")
+	if err != nil {
+		t.Fatalf("failed to fetch system treasury: %v", err)
+	}
+	if treasuryAfter.Balance != treasuryBefore.Balance {
+		t.Fatalf("expected treasury balance to remain %d, got %d", treasuryBefore.Balance, treasuryAfter.Balance)
+	}
+
+	// 3. Verify no orphaned ledger entries were created for failedID
+	entries, err := repos.Ledger.GetLedgerByWalletID(ctx, failedID)
+	if err != nil {
+		t.Fatalf("failed to get ledger for failed wallet: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("expected 0 ledger entries for rolled back wallet, got %d", len(entries))
+	}
+
+	// 4. Verify the same ID can now be created cleanly with the standard service
 	wCreated, err := walletSvc.CreateWallet(ctx, service.CreateWalletRequest{
 		ID:             failedID,
 		Name:           "USD User",
@@ -1084,7 +1134,8 @@ func TestWalletService_ReconcileBalance_ConcurrentTransfers(t *testing.T) {
 // while the losing caller either gets 409 InProgress or replays the completed result,
 // guaranteeing zero double-spending and zero duplicate transfers.
 func TestTransferService_ConcurrentReservationRace_SingleWinner(t *testing.T) {
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
 	transferSvc, walletSvc, _ := setupServicesWithRepos(t)
 
 	w1, err := walletSvc.CreateWallet(ctx, service.CreateWalletRequest{
@@ -1135,7 +1186,18 @@ func TestTransferService_ConcurrentReservationRace_SingleWinner(t *testing.T) {
 
 	// Release both callers simultaneously
 	close(startBarrier)
-	wg.Wait()
+
+	waitDone := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(waitDone)
+	}()
+
+	select {
+	case <-waitDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for concurrent reservation race callers to finish")
+	}
 
 	var newExecutions int
 	var inProgressCount int

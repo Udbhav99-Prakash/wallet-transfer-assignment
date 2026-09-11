@@ -62,5 +62,43 @@ INSERT INTO ledger_entries (id, transfer_id, wallet_id, type, amount)
 VALUES ('entry_system_treasury_opening', NULL, 'system_treasury', 'CREDIT', 100000000000000)
 ON CONFLICT (id) DO NOTHING;
 
+-- Database-level constraint trigger enforcing that every transfer has exactly two balanced entries:
+-- exactly one DEBIT on from_wallet_id and one CREDIT on to_wallet_id, matching transfer amount.
+CREATE OR REPLACE FUNCTION check_ledger_pair_integrity()
+RETURNS TRIGGER AS $$
+DECLARE
+    transfer_rec RECORD;
+    debit_count INT;
+    credit_count INT;
+    debit_sum BIGINT;
+    credit_sum BIGINT;
+BEGIN
+    IF NEW.transfer_id IS NOT NULL THEN
+        SELECT * INTO transfer_rec FROM transfers WHERE id = NEW.transfer_id;
+        IF FOUND THEN
+            SELECT COUNT(*), COALESCE(SUM(amount), 0) INTO debit_count, debit_sum
+            FROM ledger_entries
+            WHERE transfer_id = NEW.transfer_id AND type = 'DEBIT' AND wallet_id = transfer_rec.from_wallet_id;
+
+            SELECT COUNT(*), COALESCE(SUM(amount), 0) INTO credit_count, credit_sum
+            FROM ledger_entries
+            WHERE transfer_id = NEW.transfer_id AND type = 'CREDIT' AND wallet_id = transfer_rec.to_wallet_id;
+
+            IF debit_count <> 1 OR credit_count <> 1 OR debit_sum <> transfer_rec.amount OR credit_sum <> transfer_rec.amount THEN
+                RAISE EXCEPTION 'invalid ledger pair for transfer %: must have exactly 1 DEBIT on from_wallet and 1 CREDIT on to_wallet matching transfer amount', NEW.transfer_id;
+            END IF;
+        END IF;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_check_ledger_pair ON ledger_entries;
+CREATE CONSTRAINT TRIGGER trg_check_ledger_pair
+AFTER INSERT OR UPDATE ON ledger_entries
+DEFERRABLE INITIALLY DEFERRED
+FOR EACH ROW
+EXECUTE FUNCTION check_ledger_pair_integrity();
+
 
 
