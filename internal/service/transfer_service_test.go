@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -1076,3 +1077,186 @@ func TestWalletService_ReconcileBalance_ConcurrentTransfers(t *testing.T) {
 		t.Fatalf("final reconcile failed: stored=%d, ledger=%d, balanced=%v, err=%v", stored, ledger, isBalanced, err)
 	}
 }
+
+// TestTransferService_ConcurrentReservationRace_SingleWinner exercises two callers
+// simultaneously racing to reserve the same brand-new idempotency key.
+// It verifies that exactly one caller wins the reservation and executes the transfer,
+// while the losing caller either gets 409 InProgress or replays the completed result,
+// guaranteeing zero double-spending and zero duplicate transfers.
+func TestTransferService_ConcurrentReservationRace_SingleWinner(t *testing.T) {
+	ctx := context.Background()
+	transferSvc, walletSvc, _ := setupServicesWithRepos(t)
+
+	w1, err := walletSvc.CreateWallet(ctx, service.CreateWalletRequest{
+		ID:             "w_race_src_" + uuid.NewString()[:8],
+		Name:           "Sender",
+		InitialBalance: 1000,
+	})
+	if err != nil {
+		t.Fatalf("failed to create source wallet: %v", err)
+	}
+
+	w2, err := walletSvc.CreateWallet(ctx, service.CreateWalletRequest{
+		ID:             "w_race_dst_" + uuid.NewString()[:8],
+		Name:           "Receiver",
+		InitialBalance: 0,
+	})
+	if err != nil {
+		t.Fatalf("failed to create destination wallet: %v", err)
+	}
+
+	sharedKey := "race_key_" + uuid.NewString()
+	req := service.CreateTransferRequest{
+		IdempotencyKey: sharedKey,
+		FromWalletID:   w1.ID,
+		ToWalletID:     w2.ID,
+		Amount:         200,
+	}
+
+	const callers = 2
+	var wg sync.WaitGroup
+	wg.Add(callers)
+
+	startBarrier := make(chan struct{})
+	type callerResult struct {
+		resp *service.TransferResponse
+		err  error
+	}
+	results := make([]callerResult, callers)
+
+	for i := 0; i < callers; i++ {
+		go func(idx int) {
+			defer wg.Done()
+			<-startBarrier
+			resp, err := transferSvc.ExecuteTransfer(ctx, req)
+			results[idx] = callerResult{resp: resp, err: err}
+		}(i)
+	}
+
+	// Release both callers simultaneously
+	close(startBarrier)
+	wg.Wait()
+
+	var newExecutions int
+	var inProgressCount int
+	var replayCount int
+
+	for _, r := range results {
+		if r.err == nil && r.resp != nil {
+			if r.resp.IsReplay {
+				replayCount++
+			} else {
+				newExecutions++
+			}
+		} else if errors.Is(r.err, domain.ErrIdempotencyInProgress) {
+			inProgressCount++
+		} else {
+			t.Fatalf("unexpected result: resp=%v, err=%v", r.resp, r.err)
+		}
+	}
+
+	// Exactly one caller must execute the new transfer
+	if newExecutions != 1 {
+		t.Fatalf("expected exactly 1 new execution, got %d (replays=%d, inProgress=%d)", newExecutions, replayCount, inProgressCount)
+	}
+	// The other caller must either receive ErrIdempotencyInProgress or a replayed response
+	if inProgressCount+replayCount != 1 {
+		t.Fatalf("expected losing caller to get in_progress or replay, got inProgress=%d, replay=%d", inProgressCount, replayCount)
+	}
+
+	// Assert exactly one debit occurred
+	updatedW1, err := walletSvc.GetWallet(ctx, w1.ID)
+	if err != nil {
+		t.Fatalf("failed to get w1: %v", err)
+	}
+	if updatedW1.Balance != 800 {
+		t.Fatalf("expected w1 balance to be 800, got %d", updatedW1.Balance)
+	}
+
+	updatedW2, err := walletSvc.GetWallet(ctx, w2.ID)
+	if err != nil {
+		t.Fatalf("failed to get w2: %v", err)
+	}
+	if updatedW2.Balance != 200 {
+		t.Fatalf("expected w2 balance to be 200, got %d", updatedW2.Balance)
+	}
+
+	// Assert reconciliation
+	_, _, isBalanced, err := walletSvc.ReconcileBalance(ctx, w1.ID)
+	if err != nil || !isBalanced {
+		t.Fatalf("w1 reconciliation failed: %v", err)
+	}
+}
+
+func TestTransferService_IdempotencyKeyLength(t *testing.T) {
+	ctx := context.Background()
+	transferSvc, walletSvc, _ := setupServicesWithRepos(t)
+
+	w1, _ := walletSvc.CreateWallet(ctx, service.CreateWalletRequest{
+		ID:             "w_len_1",
+		Name:           "Sender",
+		InitialBalance: 1000,
+	})
+	w2, _ := walletSvc.CreateWallet(ctx, service.CreateWalletRequest{
+		ID:             "w_len_2",
+		Name:           "Receiver",
+		InitialBalance: 0,
+	})
+
+	// Key with 129 characters exceeds the 128 character column limit
+	longKey := strings.Repeat("a", 129)
+	req := service.CreateTransferRequest{
+		IdempotencyKey: longKey,
+		FromWalletID:   w1.ID,
+		ToWalletID:     w2.ID,
+		Amount:         100,
+	}
+
+	_, err := transferSvc.ExecuteTransfer(ctx, req)
+	if !errors.Is(err, domain.ErrInvalidIdempotencyKey) {
+		t.Fatalf("expected ErrInvalidIdempotencyKey for 129-char key, got %v", err)
+	}
+}
+
+func TestLedgerRepository_EnforcesBalancedPair(t *testing.T) {
+	ctx := context.Background()
+	_, _, repos := setupServicesWithRepos(t)
+
+	// Empty list should return error
+	if err := repos.Ledger.CreateLedgerEntries(ctx); !errors.Is(err, domain.ErrInvalidLedgerPair) {
+		t.Fatalf("expected ErrInvalidLedgerPair for empty entries, got %v", err)
+	}
+
+	// Single entry with transfer ID should return error
+	transferID := uuid.NewString()
+	singleEntry := domain.LedgerEntry{
+		ID:         uuid.NewString(),
+		TransferID: transferID,
+		WalletID:   "w1",
+		Type:       domain.LedgerEntryTypeDebit,
+		Amount:     100,
+	}
+	if err := repos.Ledger.CreateLedgerEntries(ctx, singleEntry); !errors.Is(err, domain.ErrInvalidLedgerPair) {
+		t.Fatalf("expected ErrInvalidLedgerPair for single transfer entry, got %v", err)
+	}
+
+	// Unbalanced amounts should return error
+	debit := domain.LedgerEntry{
+		ID:         uuid.NewString(),
+		TransferID: transferID,
+		WalletID:   "w1",
+		Type:       domain.LedgerEntryTypeDebit,
+		Amount:     100,
+	}
+	creditMismatch := domain.LedgerEntry{
+		ID:         uuid.NewString(),
+		TransferID: transferID,
+		WalletID:   "w2",
+		Type:       domain.LedgerEntryTypeCredit,
+		Amount:     150,
+	}
+	if err := repos.Ledger.CreateLedgerEntries(ctx, debit, creditMismatch); !errors.Is(err, domain.ErrInvalidLedgerPair) {
+		t.Fatalf("expected ErrInvalidLedgerPair for unbalanced amounts, got %v", err)
+	}
+}
+

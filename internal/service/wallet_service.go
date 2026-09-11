@@ -52,14 +52,12 @@ func (s *WalletService) CreateWallet(ctx context.Context, req CreateWalletReques
 	}
 
 	createOp := func(repos repository.Repositories) error {
-		if err := repos.Wallets.CreateWallet(ctx, wallet); err != nil {
-			return fmt.Errorf("failed to create wallet: %w", err)
-		}
-
-		// If seeded with an initial balance, record an initial funding transfer, double-entry ledger pair,
-		// and debit system_treasury so both wallets remain fully reconciled with their ledger entries.
+		var treasury *domain.Wallet
+		// If seeded with an initial balance, lock system_treasury FIRST to obey global lock ordering
+		// and prevent deadlocks with concurrent transfers referencing system_treasury.
 		if req.InitialBalance > 0 {
-			treasury, err := repos.Wallets.GetWalletByIDForUpdate(ctx, "system_treasury")
+			var err error
+			treasury, err = repos.Wallets.GetWalletByIDForUpdate(ctx, "system_treasury")
 			if err != nil {
 				return fmt.Errorf("failed to fetch system treasury wallet: %w", err)
 			}
@@ -69,6 +67,15 @@ func (s *WalletService) CreateWallet(ctx context.Context, req CreateWalletReques
 			if err := treasury.Debit(req.InitialBalance); err != nil {
 				return fmt.Errorf("failed to debit system treasury: %w", err)
 			}
+		}
+
+		if err := repos.Wallets.CreateWallet(ctx, wallet); err != nil {
+			return fmt.Errorf("failed to create wallet: %w", err)
+		}
+
+		// If seeded with an initial balance, record an initial funding transfer, double-entry ledger pair,
+		// and update system_treasury balance so both wallets remain fully reconciled with their ledger entries.
+		if req.InitialBalance > 0 {
 			if err := repos.Wallets.UpdateWalletBalance(ctx, treasury.ID, treasury.Balance); err != nil {
 				return fmt.Errorf("failed to update system treasury balance: %w", err)
 			}
@@ -76,7 +83,7 @@ func (s *WalletService) CreateWallet(ctx context.Context, req CreateWalletReques
 			transferID := uuid.NewString()
 			depositTransfer := &domain.Transfer{
 				ID:             transferID,
-				IdempotencyKey: fmt.Sprintf("deposit-%s", wallet.ID),
+				IdempotencyKey: fmt.Sprintf("internal:funding:%s:%s", wallet.ID, uuid.NewString()),
 				FromWalletID:   "system_treasury",
 				ToWalletID:     wallet.ID,
 				Amount:         req.InitialBalance,

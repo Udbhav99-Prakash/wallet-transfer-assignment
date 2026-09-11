@@ -21,8 +21,32 @@ func NewLedgerRepository(db DBTX) repository.LedgerRepository {
 }
 
 func (r *ledgerRepository) CreateLedgerEntries(ctx context.Context, entries ...domain.LedgerEntry) error {
-	if len(entries) == 0 {
-		return nil
+	// Strictly enforce the ledger invariant:
+	// Either an opening genesis credit entry (len == 1, no transfer ID),
+	// or exactly one matching DEBIT and CREDIT pair for a transfer (len == 2).
+	if len(entries) == 1 {
+		e := entries[0]
+		if e.TransferID != "" || e.Type != domain.LedgerEntryTypeCredit || e.Amount <= 0 || e.WalletID == "" {
+			return domain.ErrInvalidLedgerPair
+		}
+	} else if len(entries) == 2 {
+		e1, e2 := entries[0], entries[1]
+		if e1.TransferID == "" || e1.TransferID != e2.TransferID {
+			return domain.ErrInvalidLedgerPair
+		}
+		if e1.WalletID == "" || e2.WalletID == "" || e1.WalletID == e2.WalletID {
+			return domain.ErrInvalidLedgerPair
+		}
+		if e1.Amount <= 0 || e1.Amount != e2.Amount {
+			return domain.ErrInvalidLedgerPair
+		}
+		isPair := (e1.Type == domain.LedgerEntryTypeDebit && e2.Type == domain.LedgerEntryTypeCredit) ||
+			(e1.Type == domain.LedgerEntryTypeCredit && e2.Type == domain.LedgerEntryTypeDebit)
+		if !isPair {
+			return domain.ErrInvalidLedgerPair
+		}
+	} else {
+		return domain.ErrInvalidLedgerPair
 	}
 
 	query := `

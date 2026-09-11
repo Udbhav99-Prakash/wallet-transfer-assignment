@@ -53,6 +53,7 @@ func (h *TransferHandler) CreateTransfer(w http.ResponseWriter, r *http.Request)
 		case errors.Is(err, domain.ErrSameWalletTransfer),
 			errors.Is(err, domain.ErrInvalidAmount),
 			errors.Is(err, domain.ErrMissingIdempotencyKey),
+			errors.Is(err, domain.ErrInvalidIdempotencyKey),
 			errors.Is(err, domain.ErrMissingWalletID),
 			errors.Is(err, domain.ErrBalanceOverflow),
 			errors.Is(err, domain.ErrCurrencyMismatch):

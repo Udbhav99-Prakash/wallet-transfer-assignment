@@ -20,6 +20,7 @@ const (
 type IdempotencyRecord struct {
 	IdempotencyKey string            `json:"idempotencyKey"`
 	RequestHash    string            `json:"requestHash"`
+	OwnerToken     string            `json:"ownerToken,omitempty"`
 	TransferID     *string           `json:"transferId,omitempty"`
 	Status         IdempotencyStatus `json:"status"`
 	ResponseCode   int               `json:"responseCode"`

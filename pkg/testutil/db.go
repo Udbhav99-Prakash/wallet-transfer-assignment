@@ -2,6 +2,7 @@ package testutil
 
 import (
 	"context"
+	"net/url"
 	"os"
 	"testing"
 
@@ -19,19 +20,20 @@ func SetupTestDB(t *testing.T) *pgxpool.Pool {
 		dbURL = "postgres://postgres:postgrespassword@localhost:5432/wallet_db?sslmode=disable"
 	}
 
+	sanitizedEndpoint := "localhost:5432/wallet_db"
+	if u, parseErr := url.Parse(dbURL); parseErr == nil {
+		sanitizedEndpoint = u.Host + u.Path
+	}
+
 	ctx := context.Background()
 	pool, err := postgres.NewPool(ctx, dbURL)
 	if err != nil {
-		t.Fatalf("failed to connect to PostgreSQL at %s: %v. Integration tests require a running PostgreSQL instance.", dbURL, err)
+		t.Fatalf("failed to connect to PostgreSQL at %s: %v. Integration tests require a running PostgreSQL instance.", sanitizedEndpoint, err)
 		return nil
 	}
 
-	if err := postgres.Migrate(ctx, pool); err != nil {
-		t.Fatalf("failed to migrate test database: %v", err)
-	}
-
-	// Acquire PostgreSQL advisory lock on a dedicated connection to safely serialize
-	// test packages when 'go test ./...' is executed without -p 1.
+	// Acquire PostgreSQL advisory lock on a dedicated connection BEFORE running migrations
+	// to safely serialize schema DDL, seeds, and truncations across concurrent test packages.
 	lockConn, err := pool.Acquire(ctx)
 	if err != nil {
 		t.Fatalf("failed to acquire connection for test advisory lock: %v", err)
@@ -39,6 +41,12 @@ func SetupTestDB(t *testing.T) *pgxpool.Pool {
 	if _, err := lockConn.Exec(ctx, "SELECT pg_advisory_lock(777888);"); err != nil {
 		lockConn.Release()
 		t.Fatalf("failed to acquire pg_advisory_lock: %v", err)
+	}
+
+	if err := postgres.Migrate(ctx, pool); err != nil {
+		_, _ = lockConn.Exec(context.Background(), "SELECT pg_advisory_unlock(777888);")
+		lockConn.Release()
+		t.Fatalf("failed to migrate test database: %v", err)
 	}
 
 	// Truncate all tables to guarantee test isolation

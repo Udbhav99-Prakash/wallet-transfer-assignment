@@ -180,7 +180,7 @@ CREATE TABLE transfers (
 -- Double-entry ledger entries table
 CREATE TABLE ledger_entries (
     id VARCHAR(64) PRIMARY KEY,
-    transfer_id VARCHAR(64) NOT NULL REFERENCES transfers(id) ON DELETE RESTRICT,
+    transfer_id VARCHAR(64) REFERENCES transfers(id) ON DELETE RESTRICT, -- Nullable for genesis/opening balance entries without an associated transfer
     wallet_id VARCHAR(64) NOT NULL REFERENCES wallets(id) ON DELETE RESTRICT,
     type VARCHAR(16) NOT NULL CHECK (type IN ('DEBIT', 'CREDIT')),
     amount BIGINT NOT NULL CHECK (amount > 0),
@@ -191,6 +191,7 @@ CREATE TABLE ledger_entries (
 CREATE TABLE idempotency_records (
     idempotency_key VARCHAR(128) PRIMARY KEY,
     request_hash VARCHAR(64) NOT NULL,
+    owner_token VARCHAR(64) NOT NULL DEFAULT '',
     transfer_id VARCHAR(64) REFERENCES transfers(id),
     status VARCHAR(32) NOT NULL CHECK (status IN ('IN_PROGRESS', 'COMPLETED', 'FAILED')),
     response_code INT,
@@ -199,11 +200,13 @@ CREATE TABLE idempotency_records (
     updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
--- Indexes for performance
+-- Indexes for performance and integrity
 CREATE INDEX idx_transfers_from_wallet ON transfers(from_wallet_id);
 CREATE INDEX idx_transfers_to_wallet ON transfers(to_wallet_id);
 CREATE INDEX idx_ledger_wallet ON ledger_entries(wallet_id);
 CREATE INDEX idx_ledger_transfer ON ledger_entries(transfer_id);
+CREATE UNIQUE INDEX idx_ledger_entries_transfer_type ON ledger_entries (transfer_id, type) WHERE transfer_id IS NOT NULL;
+CREATE UNIQUE INDEX idx_ledger_entries_transfer_wallet ON ledger_entries (transfer_id, wallet_id) WHERE transfer_id IS NOT NULL;
 ```
 
 > **Note on Money Representation**: All monetary values are represented as `BIGINT` representing minor currency units (e.g. cents) to avoid IEEE 754 floating-point rounding errors.
@@ -346,7 +349,7 @@ Following the Red-Green-Refactor (TDD) development discipline and comprehensive 
      - 10 concurrent goroutines attempt to transfer $20 each.
      - Exactly 5 must succeed and 5 must fail with insufficient funds. Final balance must be exactly $0.
    - **Deadlock Stress Test**:
-     - 50 concurrent transfers from Wallet A to Wallet B and Wallet B to Wallet A simultaneously.
+     - 40 concurrent bidirectional transfers (20 from Wallet A to Wallet B and 20 from Wallet B to Wallet A simultaneously).
      - All must complete without deadlock errors, and net balances must match arithmetic expectations.
 
 ---

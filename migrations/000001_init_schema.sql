@@ -35,6 +35,7 @@ ALTER TABLE ledger_entries ALTER COLUMN transfer_id DROP NOT NULL;
 CREATE TABLE IF NOT EXISTS idempotency_records (
     idempotency_key VARCHAR(128) PRIMARY KEY,
     request_hash VARCHAR(64) NOT NULL,
+    owner_token VARCHAR(64) NOT NULL DEFAULT '',
     transfer_id VARCHAR(64) REFERENCES transfers(id),
     status VARCHAR(32) NOT NULL CHECK (status IN ('IN_PROGRESS', 'COMPLETED', 'FAILED')),
     response_code INT,
@@ -42,11 +43,14 @@ CREATE TABLE IF NOT EXISTS idempotency_records (
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+ALTER TABLE idempotency_records ADD COLUMN IF NOT EXISTS owner_token VARCHAR(64) NOT NULL DEFAULT '';
 
 CREATE INDEX IF NOT EXISTS idx_transfers_from_wallet ON transfers(from_wallet_id);
 CREATE INDEX IF NOT EXISTS idx_transfers_to_wallet ON transfers(to_wallet_id);
 CREATE INDEX IF NOT EXISTS idx_ledger_wallet ON ledger_entries(wallet_id);
 CREATE INDEX IF NOT EXISTS idx_ledger_transfer ON ledger_entries(transfer_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_ledger_entries_transfer_type ON ledger_entries (transfer_id, type) WHERE transfer_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_ledger_entries_transfer_wallet ON ledger_entries (transfer_id, wallet_id) WHERE transfer_id IS NOT NULL;
 
 -- System Treasury wallet for double-entry initial deposits
 INSERT INTO wallets (id, name, balance, currency)

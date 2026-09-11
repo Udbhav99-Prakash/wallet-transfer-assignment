@@ -7,6 +7,7 @@ import (
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -584,3 +585,24 @@ func TestHandler_CreateWallet_InternalServerError(t *testing.T) {
 		t.Fatalf("expected stable generic error 'internal server error', got '%s'", errResp.Error)
 	}
 }
+
+func TestHandler_Transfer_IdempotencyKeyTooLong(t *testing.T) {
+	router := setupTestServer(t)
+
+	reqBody, _ := json.Marshal(service.CreateTransferRequest{
+		IdempotencyKey: strings.Repeat("k", 129),
+		FromWalletID:   "w1",
+		ToWalletID:     "w2",
+		Amount:         100,
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/transfers", bytes.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 Bad Request for key > 128 chars, got %d: %s", w.Code, w.Body.String())
+	}
+}
+

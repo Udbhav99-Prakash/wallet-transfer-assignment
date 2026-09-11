@@ -47,4 +47,13 @@ var (
 
 	// ErrWalletAlreadyExists is returned when attempting to create a wallet with an existing ID.
 	ErrWalletAlreadyExists = errors.New("wallet already exists")
+
+	// ErrInvalidIdempotencyKey is returned when the idempotency key is invalid or exceeds maximum length.
+	ErrInvalidIdempotencyKey = errors.New("idempotency key must not be empty and must not exceed 128 characters")
+
+	// ErrInvalidLedgerPair is returned when ledger entries do not form a balanced double-entry pair.
+	ErrInvalidLedgerPair = errors.New("ledger entries must contain exactly one matching DEBIT and CREDIT pair")
+
+	// ErrIdempotencyLeaseLost is returned when a worker attempts to finalize or cleanup an idempotency reservation whose lease was lost.
+	ErrIdempotencyLeaseLost = errors.New("idempotency reservation lease was lost to a concurrent worker")
 )

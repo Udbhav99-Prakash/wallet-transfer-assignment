@@ -39,8 +39,8 @@ Antigravity was employed as an active **pair programmer and systems design sound
 
 ### D. Test-Driven Concurrency & Stress Verification
 - Antigravity was used to construct rigorous concurrency regression tests:
-  - 20 concurrent bidirectional transfers between two wallets to verify zero deadlocks.
-  - 20 concurrent debits against a shared wallet to verify zero double-spending.
+  - 20 concurrent bidirectional transfers in each direction (40 total) between two wallets to verify zero deadlocks.
+  - 10 concurrent debits against a shared wallet to verify zero double-spending (matching `TestTransferService_ConcurrentDebits_NoDoubleSpend`).
   - Concurrent background transfers executed during active balance reconciliation to verify zero false mismatches.
 - All tests were executed against a real PostgreSQL 16 instance with bounded contexts to eliminate hanging test suites.
 
@@ -102,6 +102,10 @@ Below is the complete chronological log of all 42 explicit prompts provided duri
 | **40** | `2026-09-11 21:09:56` | Verification | *have we coveed everthing?* |
 | **41** | `2026-09-11 21:14:11` | Verification | *before there were so many errors so now is it all ok ?* |
 | **42** | `2026-09-11 21:15:55` | AI Disclosure | *AI disclosure: Detail how you used AI to help with your submission...* |
+| **43** | `2026-09-12 02:52:54` | Git & Commit | *give me proper commit message* |
+| **44** | `2026-09-12 02:54:56` | Git & Commit | *sure* |
+| **45** | `2026-09-12 03:16:08` | Review Fixes | *again so many comments* |
+| **46** | `2026-09-12 03:16:28` | Review Fixes | *[Follow-up Review Feedback on PR #169 covering CI fallback, owner-token lease fencing, key length validation, barrier race test, funding key namespace, test advisory lock timing, and documentation alignment]* |
 
 ---
 
@@ -109,16 +113,19 @@ Below is the complete chronological log of all 42 explicit prompts provided duri
 
 The author is fully prepared to explain and defend every design decision and line of code in the implementation during the technical discussion:
 
-1. **Short-Committed Reservation Protocol**:
+1. **Short-Committed Reservation Protocol & Owner-Token Lease Fencing**:
    - Why we insert `IN_PROGRESS` in an immediate short transaction rather than keeping an uncommitted lock open during the entire transfer: under burst retries, overlapping requests immediately receive `409 Conflict` without tying up database connection pool workers.
-   - Stale-owner recovery mechanism: if a worker process crashes while holding an `IN_PROGRESS` reservation, reservations older than 30 seconds are reclaimed safely.
+   - Stale-owner recovery & fencing: if a worker process crashes while holding an `IN_PROGRESS` reservation, reservations older than 30 seconds are reclaimed safely. To prevent slow/paused workers from corrupting or deleting state after a lease reclaim, every reservation and reclaim generates an `owner_token`. Updates and deferred cleanups are fenced by `owner_token`.
 2. **Deterministic Deadlock Prevention**:
    - Why locking ordering is sorted lexicographically (`from_id < to_id ? (from, to) : (to, from)`): breaks the circular wait condition (Coffman condition) across concurrent bidirectional transfers.
-3. **Double-Entry Ledger Integrity & Atomic Reconciliation**:
+   - Initial wallet funding locks `system_treasury` before inserting the user wallet to adhere strictly to the global lock hierarchy.
+3. **Double-Entry Ledger Integrity & Database-Level Constraints**:
    - Stored wallet balances are updated atomically alongside two ledger entries (`DEBIT` and `CREDIT`) within a single ACID transaction.
+   - Database-level composite unique indexes (`(transfer_id, type)` and `(transfer_id, wallet_id)`) and repository validations guarantee that every transfer produces exactly one matching DEBIT/CREDIT pair across distinct wallets.
    - `ReconcileBalance` performs `SELECT ... FOR UPDATE` row locking on the wallet inside a transaction while aggregating ledger records, eliminating false concurrency mismatches.
 4. **Length-Delimited Preimage Hashing**:
    - Why `%d:%s:%d:%s:%d` prevents delimiter injection attacks across colon characters.
 5. **HTTP Status Code Fidelity on Replays**:
    - Caching `response_code` in `idempotency_records` so that a replayed successful transfer returns `201 Created` while a replayed overdraft returns `422 Unprocessable Entity`.
+
 

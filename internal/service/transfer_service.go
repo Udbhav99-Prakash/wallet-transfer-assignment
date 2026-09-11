@@ -40,6 +40,9 @@ func (s *TransferService) ExecuteTransfer(ctx context.Context, req CreateTransfe
 	if req.IdempotencyKey == "" {
 		return nil, domain.ErrMissingIdempotencyKey
 	}
+	if len(req.IdempotencyKey) > 128 {
+		return nil, domain.ErrInvalidIdempotencyKey
+	}
 
 	requestHash := domain.ComputeRequestHash(req.FromWalletID, req.ToWalletID, req.Amount)
 
@@ -97,9 +100,11 @@ func (s *TransferService) ExecuteTransfer(ctx context.Context, req CreateTransfe
 		staleTimeout = 30 * time.Second
 	}
 
+	ownerToken := uuid.NewString()
 	record := &domain.IdempotencyRecord{
 		IdempotencyKey: req.IdempotencyKey,
 		RequestHash:    requestHash,
+		OwnerToken:     ownerToken,
 		Status:         domain.IdempotencyStatusInProgress,
 	}
 
@@ -131,14 +136,14 @@ func (s *TransferService) ExecuteTransfer(ctx context.Context, req CreateTransfe
 	}
 
 	// The caller owns the reservation.
-	// If the transfer execution fails unexpectedly (e.g. context cancellation, DB connection drop),
+	// If the transfer execution fails unexpectedly (e.g. context cancellation, DB connection drop, commit failure),
 	// delete the in-progress reservation so subsequent retries do not have to wait for stale timeout.
 	success := false
 	defer func() {
 		if !success {
 			cleanupCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 			defer cancel()
-			_ = s.repos.Idempotency.DeleteIdempotency(cleanupCtx, req.IdempotencyKey)
+			_ = s.repos.Idempotency.DeleteInProgress(cleanupCtx, req.IdempotencyKey, ownerToken)
 		}
 	}()
 
@@ -226,7 +231,6 @@ func (s *TransferService) ExecuteTransfer(ctx context.Context, req CreateTransfe
 
 			finalResponse = resp
 			isInsufficientFunds = true
-			success = true
 			// Return nil so the transaction commits the FAILED transfer record and idempotency record
 			return nil
 		}
@@ -283,18 +287,21 @@ func (s *TransferService) ExecuteTransfer(ctx context.Context, req CreateTransfe
 		record.TransferID = &transfer.ID
 		record.ResponseCode = http.StatusCreated
 		record.ResponseBody = string(respBytes)
+		record.OwnerToken = ownerToken
 		if updateErr := txRepos.Idempotency.UpdateIdempotency(ctx, record); updateErr != nil {
 			return updateErr
 		}
 
 		finalResponse = resp
-		success = true
 		return nil
 	})
 
 	if txErr != nil {
 		return nil, txErr
 	}
+
+	// Transaction has successfully committed; disarm deferred cleanup
+	success = true
 
 	if isInsufficientFunds {
 		return finalResponse, domain.ErrInsufficientFunds
