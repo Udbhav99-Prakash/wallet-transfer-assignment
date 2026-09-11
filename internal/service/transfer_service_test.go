@@ -1259,4 +1259,3 @@ func TestLedgerRepository_EnforcesBalancedPair(t *testing.T) {
 		t.Fatalf("expected ErrInvalidLedgerPair for unbalanced amounts, got %v", err)
 	}
 }
-

@@ -605,4 +605,3 @@ func TestHandler_Transfer_IdempotencyKeyTooLong(t *testing.T) {
 		t.Fatalf("expected 400 Bad Request for key > 128 chars, got %d: %s", w.Code, w.Body.String())
 	}
 }
-
