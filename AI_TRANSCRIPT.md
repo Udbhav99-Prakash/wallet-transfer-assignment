@@ -2,7 +2,7 @@
 
 This document contains the chronological record of the interaction session with Google Antigravity during the development, testing, and refinement of the Wallet Transfer Service.
 
-- **Total Interaction Turns**: 68
+- **Total Interaction Turns**: 69
 - **Primary Tool**: Google Antigravity
 - **Underlying Model**: Advanced Agentic Reasoning Model
 
@@ -3839,5 +3839,37 @@ All 16 points raised across the review comments have been systematically address
    - Clarified in Section 6.2 that `POST /wallets` creates zero-balance wallets, while initial balance funding requires admin authorization via `POST /admin/wallets`.
    - Updated Section 10.1 test credentials to `wallet_app:wallet_app_password`.
    - Reconciled transcript turn count (68) and prompt log table in `AI_DISCLOSURE.md`.
+
+All tests pass (`go test -count=1 ./...`) and `go vet ./...` succeeds with zero warnings.
+
+---
+
+## Turn 69 — 2026-09-12T10:55:00Z
+
+### User Request
+```text
+internal/repository/postgres/idempotency_repo.go:190
+
+ReserveIdempotency initializes record.UpdatedAt once, and all terminal finalization callers pass that same value back here. As a result, a completed/failed record gets its original reservation timestamp instead of the finalization time (and a long-running transfer can overwrite a newer heartbeat timestamp). Always set updated_at to the current UTC time when updating the record.
+	updatedAt := record.UpdatedAt
+	if updatedAt.IsZero() {
+		updatedAt = time.Now().UTC()
+	}
+```
+
+**Tools Executed**: `view_file`, `replace_file_content`, `run_command`, `schedule`, `manage_task`
+
+### AI Response / Outcome
+
+The idempotency finalization timestamp handling has been corrected, verified, and integrated:
+
+1. **Unconditional Current UTC Timestamp on Idempotency Updates ([`internal/repository/postgres/idempotency_repo.go`](file:///c:/Go/src/wallet-transfer-assignment/internal/repository/postgres/idempotency_repo.go#L180-L205))**:
+   - Replaced `updatedAt := record.UpdatedAt; if updatedAt.IsZero() { updatedAt = time.Now().UTC() }` with unconditional `now := time.Now().UTC(); record.UpdatedAt = now`.
+   - Guaranteed that `UPDATE idempotency_records SET ... updated_at = $5` always writes the current timestamp when completing or failing a record, rather than persisting the initial reservation timestamp or overwriting newer heartbeat timestamps.
+   - Synchronized the caller's in-memory `record.UpdatedAt` to `now`.
+
+2. **Test Suite Verification ([`internal/service/transfer_service_test.go`](file:///c:/Go/src/wallet-transfer-assignment/internal/service/transfer_service_test.go#L2925-L2970))**:
+   - Added unit test `TestIdempotencyRepo_UpdateIdempotency_AlwaysSetsCurrentTimestamp`: asserts that `UpdateIdempotency` updates both the in-memory struct and PostgreSQL `updated_at` column to a strictly newer timestamp than the reservation timestamp, even when the caller passes a record with a pre-existing `UpdatedAt`.
+   - Updated stale recovery tests to use direct `pool.Exec` when backdating timestamps for testing purposes.
 
 All tests pass (`go test -count=1 ./...`) and `go vet ./...` succeeds with zero warnings.

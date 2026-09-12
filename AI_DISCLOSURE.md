@@ -48,7 +48,7 @@ Antigravity was employed as an active **pair programmer and systems design sound
 
 ## 3. Session Transcript & Prompt Records
 
-The complete transcript of all 68 interaction turns—including exact prompt text, tool invocations, and AI responses—is preserved in this repository:
+The complete transcript of all 69 interaction turns—including exact prompt text, tool invocations, and AI responses—is preserved in this repository:
 - **Readable Session Transcript**: [`AI_TRANSCRIPT.md`](./AI_TRANSCRIPT.md)
 - **Raw Agent Interaction Log**: Persisted in the session metadata logs.
 
@@ -56,7 +56,7 @@ The complete transcript of all 68 interaction turns—including exact prompt tex
 
 ## 4. Chronological List of All Prompts
 
-Below is the complete chronological log of all 68 explicit prompts provided during the development session:
+Below is the complete chronological log of all 69 explicit prompts provided during the development session:
 
 | # | Timestamp (UTC) | Phase | User Prompt |
 |---|---|---|---|
@@ -128,6 +128,7 @@ Below is the complete chronological log of all 68 explicit prompts provided duri
 | **66** | `2026-09-12 09:15:00` | Review Fixes | *[Comprehensive Review on PR #169: CanDebit strict positive amount, bounded ledger pagination, safe-by-default APP_ENV & explicit ADMIN_KEY requirement, owner-token lease update fencing, atomic pending-to-terminal transfer status enforcement, commit-time transfer status trigger verification, migration role separation, and post-acquisition advisory lock cancellation test redesign]* |
 | **67** | `2026-09-12 10:00:00` | Review Fixes | *[Follow-up Review Feedback on PR #169 covering pool headroom & tx semaphore, terminal-only stale recovery, error propagation during transfer lookup, un-locked preflight removal, PostgreSQL 16 schema permissions, and test database validation]* |
 | **68** | `2026-09-12 10:35:00` | Review Fixes | *[Comprehensive Hardening on PR #169: Dedicated heartbeat connection pool isolation, dynamic capacity derivation & immutable tx semaphore, bounded idempotency reservation retry & orphaned state cleanup, single-connection pool (MaxConns=1) migration safety & deferred rollback, terminal transfer status immutability & non-PROCESSED ledger trigger enforcement, CI test execution under least-privileged wallet_app role, test DB allowlist verification & credential sanitization, and full documentation/turn reconciliation]* |
+| **69** | `2026-09-12 10:55:00` | Review Fixes | *In [internal/repository/postgres/idempotency_repo.go]: ReserveIdempotency initializes record.UpdatedAt once, and all terminal finalization callers pass that same value back here... Always set updated_at to the current UTC time when updating the record.* |
 
 ---
 
@@ -220,3 +221,5 @@ The author is fully prepared to explain and defend every design decision and lin
     - Why `ExecuteTransfer` initiates a bounded background `DeleteInProgress` on reservation errors: prevents leaving orphaned `IN_PROGRESS` records if context cancellation or connection drops occur during key reservation.
 28. **Least-Privilege Execution in CI**:
     - Why CI runs integration tests using `wallet_app:wallet_app_password` on `wallet_test_db`: verifies that migrations, table operations, constraint triggers, truncations, and repository queries all succeed under non-superuser privileges, preventing deployment failures caused by missing runtime role grants.
+29. **Unconditional Current UTC Timestamp on Idempotency Updates**:
+    - Why `UpdateIdempotency` unconditionally sets `updated_at = time.Now().UTC()`: `ReserveIdempotency` initializes `record.UpdatedAt` at reservation time. Terminal finalization callers pass the in-memory record back upon completion. If `UpdateIdempotency` preserved `record.UpdatedAt`, completed and failed records would retain their initial reservation timestamp instead of the finalization time, and a long-running transfer would overwrite newer background heartbeat timestamps with stale reservation timestamps. Setting `updated_at` to the current UTC time guarantees non-decreasing, accurate audit and finalization timestamps.

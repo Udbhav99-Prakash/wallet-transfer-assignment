@@ -2499,7 +2499,7 @@ func TestWalletService_NilTxManagerFails(t *testing.T) {
 
 func TestTransferService_StaleRecovery_PendingTransfer_ReturnsInProgress(t *testing.T) {
 	ctx := context.Background()
-	transferSvc, walletSvc, repos := setupServicesWithRepos(t)
+	transferSvc, walletSvc, pool, repos := setupServicesWithPool(t)
 
 	w1, _ := walletSvc.CreateWallet(ctx, service.CreateWalletRequest{ID: "w_stale_pend_1", Name: "W1", InitialBalance: 500})
 	w2, _ := walletSvc.CreateWallet(ctx, service.CreateWalletRequest{ID: "w_stale_pend_2", Name: "W2", InitialBalance: 500})
@@ -2509,19 +2509,16 @@ func TestTransferService_StaleRecovery_PendingTransfer_ReturnsInProgress(t *test
 
 	// 1. Seed stale in-progress reservation (updated 2 minutes ago)
 	staleTime := time.Now().UTC().Add(-2 * time.Minute)
-	rec, _, err := repos.Idempotency.ReserveIdempotency(ctx, &domain.IdempotencyRecord{
+	_, _, err := repos.Idempotency.ReserveIdempotency(ctx, &domain.IdempotencyRecord{
 		IdempotencyKey: idemKey,
 		RequestHash:    requestHash,
 		OwnerToken:     uuid.NewString(),
 		Status:         domain.IdempotencyStatusInProgress,
-		CreatedAt:      staleTime,
-		UpdatedAt:      staleTime,
 	}, 30*time.Second)
 	if err != nil {
 		t.Fatalf("failed to reserve idempotency: %v", err)
 	}
-	rec.UpdatedAt = staleTime
-	if err := repos.Idempotency.UpdateIdempotency(ctx, rec); err != nil {
+	if _, err := pool.Exec(ctx, "UPDATE idempotency_records SET updated_at = $1 WHERE idempotency_key = $2", staleTime, idemKey); err != nil {
 		t.Fatalf("failed to update idempotency timestamp: %v", err)
 	}
 
@@ -2568,7 +2565,7 @@ func (f *lookupFailingTransferRepo) GetTransferByIdempotencyKey(ctx context.Cont
 
 func TestTransferService_StaleRecovery_LookupError_PropagatesError(t *testing.T) {
 	ctx := context.Background()
-	_, walletSvc, repos := setupServicesWithRepos(t)
+	_, walletSvc, pool, repos := setupServicesWithPool(t)
 
 	w1, _ := walletSvc.CreateWallet(ctx, service.CreateWalletRequest{ID: "w_stale_err_1", Name: "W1", InitialBalance: 500})
 	w2, _ := walletSvc.CreateWallet(ctx, service.CreateWalletRequest{ID: "w_stale_err_2", Name: "W2", InitialBalance: 500})
@@ -2578,16 +2575,13 @@ func TestTransferService_StaleRecovery_LookupError_PropagatesError(t *testing.T)
 
 	// Seed stale in-progress reservation
 	staleTime := time.Now().UTC().Add(-2 * time.Minute)
-	rec, _, _ := repos.Idempotency.ReserveIdempotency(ctx, &domain.IdempotencyRecord{
+	_, _, _ = repos.Idempotency.ReserveIdempotency(ctx, &domain.IdempotencyRecord{
 		IdempotencyKey: idemKey,
 		RequestHash:    requestHash,
 		OwnerToken:     uuid.NewString(),
 		Status:         domain.IdempotencyStatusInProgress,
-		CreatedAt:      staleTime,
-		UpdatedAt:      staleTime,
 	}, 30*time.Second)
-	rec.UpdatedAt = staleTime
-	_ = repos.Idempotency.UpdateIdempotency(ctx, rec)
+	_, _ = pool.Exec(ctx, "UPDATE idempotency_records SET updated_at = $1 WHERE idempotency_key = $2", staleTime, idemKey)
 
 	// Wrap transfer repo with simulated lookup failure
 	faultyRepos := repos
@@ -2928,3 +2922,49 @@ func TestIdempotencyRepo_ReserveRetryOnConcurrentDeletion(t *testing.T) {
 		t.Fatalf("expected reserve to succeed as owner with token2, got isOwner=%v, owner=%s", isOwner2, res2.OwnerToken)
 	}
 }
+
+func TestIdempotencyRepo_UpdateIdempotency_AlwaysSetsCurrentTimestamp(t *testing.T) {
+	ctx := context.Background()
+	_, _, repos := setupServicesWithRepos(t)
+
+	idemKey := "key_update_ts_" + uuid.NewString()
+	token := uuid.NewString()
+
+	// 1. Reserve key
+	rec, isOwner, err := repos.Idempotency.ReserveIdempotency(ctx, &domain.IdempotencyRecord{
+		IdempotencyKey: idemKey,
+		RequestHash:    "hash_test",
+		OwnerToken:     token,
+		Status:         domain.IdempotencyStatusInProgress,
+	}, 30*time.Second)
+	if err != nil || !isOwner {
+		t.Fatalf("failed to reserve idempotency: %v", err)
+	}
+	initialUpdatedAt := rec.UpdatedAt
+
+	// Sleep 50ms to ensure time elapses
+	time.Sleep(50 * time.Millisecond)
+
+	// 2. Finalize record passing the original record (which has initialUpdatedAt)
+	rec.Status = domain.IdempotencyStatusCompleted
+	rec.ResponseCode = 201
+	rec.ResponseBody = `{"status":"ok"}`
+	if err := repos.Idempotency.UpdateIdempotency(ctx, rec); err != nil {
+		t.Fatalf("failed to update idempotency: %v", err)
+	}
+
+	// 3. In-memory struct must have been updated to a newer timestamp
+	if !rec.UpdatedAt.After(initialUpdatedAt) {
+		t.Fatalf("expected in-memory record.UpdatedAt (%v) to be after initial (%v)", rec.UpdatedAt, initialUpdatedAt)
+	}
+
+	// 4. Stored record in PostgreSQL must have the new current timestamp, not the initial reservation timestamp
+	stored, err := repos.Idempotency.GetIdempotency(ctx, idemKey)
+	if err != nil || stored == nil {
+		t.Fatalf("failed to get idempotency: %v", err)
+	}
+	if !stored.UpdatedAt.After(initialUpdatedAt) {
+		t.Fatalf("expected stored UpdatedAt (%v) to be after initial (%v)", stored.UpdatedAt, initialUpdatedAt)
+	}
+}
+
