@@ -31,8 +31,13 @@ func (h *WalletHandler) CreateWallet(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case errors.Is(err, domain.ErrWalletNameRequired),
 			errors.Is(err, domain.ErrNegativeBalance),
-			errors.Is(err, domain.ErrCurrencyMismatch):
+			errors.Is(err, domain.ErrCurrencyMismatch),
+			errors.Is(err, domain.ErrBalanceOverflow):
 			WriteError(w, http.StatusBadRequest, err.Error())
+			return
+
+		case errors.Is(err, domain.ErrInsufficientFunds):
+			WriteError(w, http.StatusUnprocessableEntity, err.Error())
 			return
 
 		case errors.Is(err, domain.ErrWalletAlreadyExists):

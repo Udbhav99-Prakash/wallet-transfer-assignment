@@ -557,6 +557,25 @@ func TestHandler_CreateWallet_Conflict(t *testing.T) {
 	}
 }
 
+func TestHandler_CreateWallet_InsufficientTreasuryFunds(t *testing.T) {
+	router := setupTestServer(t)
+
+	// Treasury balance is 100_000_000_000_000; requesting more must return 422 Unprocessable Entity
+	body, _ := json.Marshal(service.CreateWalletRequest{
+		ID:             "wallet_excessive_funds",
+		Name:           "Billionaire Wallet",
+		InitialBalance: 100000000000001,
+	})
+	req := httptest.NewRequest(http.MethodPost, "/wallets", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422 Unprocessable Entity for initial balance exceeding treasury, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
 func TestHandler_CreateWallet_InternalServerError(t *testing.T) {
 	router := setupTestServer(t)
 

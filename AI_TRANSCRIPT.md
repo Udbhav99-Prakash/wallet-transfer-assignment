@@ -2,7 +2,7 @@
 
 This document contains the chronological record of the interaction session with Google Antigravity during the development, testing, and refinement of the Wallet Transfer Service.
 
-- **Total Interaction Turns**: 53
+- **Total Interaction Turns**: 54
 - **Primary Tool**: Google Antigravity
 - **Underlying Model**: Advanced Agentic Reasoning Model
 
@@ -2851,78 +2851,66 @@ Stderr:
 push the changes
 ```
 
-**Tools Executed**: `run_command` (2), `manage_task` (2), `view_file` (1)
+**Tools Executed**: `run_command` (8), `manage_task` (2), `view_file` (7), `replace_file_content` (2)
 
 ### AI Response / Outcome
 
-Created At: 2026-09-12T04:12:27+05:30
-Completed At: 2026-09-12T04:12:27+05:30
-File Path: `file:///c:/Users/hi/.gemini/antigravity/brain/5fe2da8d-1a97-46f2-9d72-ea79457dc49a/scratch/generate_transcript.py`
-Total Lines: 81
-Total Bytes: 3135
-Showing lines 1 to 60
-The following code has been modified to include a line number before every line, in the format: <line_number>: <original_line>. Please note that any changes targeting the original code should remove the line number, colon, and leading space.
-1: import json
-2: import os
-3: 
-4: transcript_path = r"C:\Users\hi\.gemini\antigravity\brain\5fe2da8d-1a97-46f2-9d72-ea79457dc49a\.system_generated\logs\transcript.jsonl"
-5: output_path = r"c:\Go\src\wallet-transfer-assignment\AI_TRANSCRIPT.md"
-6: 
-7: turns = []
-8: current_turn = None
-9: 
-10: with open(transcript_path, "r", encoding="utf-8") as f:
-11:     for line in f:
-12:         d = json.loads(line)
-13:         t = d.get("type")
-14:         s = d.get("source")
-15:         if t == "USER_INPUT" and s == "USER_EXPLICIT":
-16:             if current_turn:
-17:                 turns.append(current_turn)
-18:             content = d.get("content", "").strip()
-19:             if "<USER_REQUEST>" in content:
-20:                 content = content.split("<USER_REQUEST>")[1].split("</USER_REQUEST>")[0].strip()
-21:             current_turn = {
-22:                 "timestamp": d.get("created_at"),
-23:                 "prompt": content,
-24:                 "responses": [],
-25:                 "tools": []
-26:             }
-27:         elif current_turn:
-28:             if t == "PLANNER_RESPONSE" and s == "MODEL":
-29:                 c = d.get("content", "")
-30:                 if c and c.strip():
-31:                     current_turn["responses"].append(c.strip())
-32:                 for tc in d.get("tool_calls", []):
-33:                     current_turn["tools"].append(tc.get("name", "tool"))
-34:             elif t == "GENERIC" and s == "MODEL":
-35:                 c = d.get("content", "")
-36:                 if c and c.strip():
-37:                     current_turn["responses"].append(c.strip())
-38: 
-39: if current_turn:
-40:     turns.append(current_turn)
-41: 
-42: with open(output_path, "w", encoding="utf-8") as out:
-43:     out.write("# AI Session Transcript\n\n")
-44:     out.write("This document contains the chronological record of the interaction session with Google Antigravity during the development, testing, and refinement of the Wallet Transfer Service.\n\n")
-45:     out.write(f"- **Total Interaction Turns**: {len(turns)}\n")
-46:     out.write("- **Primary Tool**: Google Antigravity\n")
-47:     out.write("- **Underlying Model**: Advanced Agentic Reasoning Model\n\n")
-48:     out.write("---\n\n")
-49: 
-50:     for idx, turn in enumerate(turns, 1):
-51:         ts = turn["timestamp"]
-52:         prompt = turn["prompt"]
-53:         tools = turn["tools"]
-54:         responses = turn["responses"]
-55: 
-56:         out.write(f"## Turn {idx} — {ts}\n\n")
-57:         out.write("### User Request\n")
-58:         out.write("```text\n")
-59:         out.write(f"{prompt}\n")
-60:         out.write("```\n\n")
-The above content does NOT show the entire file contents. If you need to view any lines of the file which were not shown to complete your task, call this tool again to view those lines.
+All changes addressing the latest code review comments have been verified, committed, and pushed to `origin/solution/udbhav-prakash`.
+
+### Summary of Changes Pushed (`commit 6c8f73f`)
+
+1. **Atomic Multi-Row Ledger Insert (`internal/repository/postgres/ledger_repo.go`)**:
+   - Switched from looping individual `INSERT` queries to a single multi-row `INSERT INTO ledger_entries (...) VALUES (...), (...)` statement when inserting pairs (`len(entries) == 2`).
+   - Guarantees statement-level atomicity even when executed against a connection pool without an outer transaction, preventing partial pair insertions or intermediate constraint violations.
+
+2. **In-Flight Lease Loss Cancellation (`internal/service/transfer_service.go`)**:
+   - Wrapped transaction execution in a cancellable context (`txCtx, cancelTx := context.WithCancel(ctx)`).
+   - If the background heartbeat receives `domain.ErrIdempotencyLeaseLost`, it immediately calls `cancelTx()`, terminating in-flight queries and releasing wallet locks immediately rather than executing wasted work.
+   - Added preflight cleanup (`cleanupStaleReservation`) to remove stale `IN_PROGRESS` reservations if business validation fails before transfer execution.
+
+3. **Strict Migration Error Handling & Advisory Locking (`migrations/migrations.go`)**:
+   - Acquired a dedicated PostgreSQL session advisory lock (`SELECT pg_advisory_lock(888999)`) to serialize concurrent startup instances.
+   - Strictly inspected `errors.Is(err, pgx.ErrNoRows)` on applied version lookups, ensuring unexpected DB connection/permission errors propagate rather than being masked as unapplied migrations.
+
+4. **Transfer Status Trigger & Ledger Immutability (`migrations/000001_init_schema.sql`)**:
+   - Added `check_null_transfer_credit` constraint (`transfer_id IS NOT NULL OR type = 'CREDIT'`) on `ledger_entries`.
+   - Added commit-deferred constraint trigger `trg_check_transfer_processed` on `transfers`, preventing any transfer from committing with status `PROCESSED` without a balanced double-entry pair matching the transfer amount.
+   - Added immutability trigger `trg_prevent_ledger_mutation` (`BEFORE DELETE OR UPDATE ON ledger_entries`) to preserve the financial audit log.
+
+5. **Documentation Alignment (`problem_understanding.md`)**:
+   - Updated the documented DDL to include `CONSTRAINT check_distinct_wallets CHECK (from_wallet_id <> to_wallet_id)`, `check_null_transfer_credit`, `trg_check_transfer_processed`, and `trg_prevent_ledger_mutation`.
+   - Clarified the complementary enforcement boundaries between application transactions and database constraint triggers.
+
+6. **Disclosure & Transcript Synchronized**:
+   - Updated [`AI_DISCLOSURE.md`](file:///c:/Go/src/wallet-transfer-assignment/AI_DISCLOSURE.md) and regenerated [`AI_TRANSCRIPT.md`](file:///c:/Go/src/wallet-transfer-assignment/AI_TRANSCRIPT.md) reflecting all 53 turns.
+
+---
+
+## Turn 54 — 2026-09-12T06:42:19Z
+
+### User Request
+```text
+internal/handler/wallet_handler.go:35
+
+When a requested initial balance exceeds the system treasury, WalletService.CreateWallet returns ErrInsufficientFunds, but this switch falls through to the generic 500 response. That is a normal business rejection rather than an internal failure; map it to a client/business status (for example 422, as the transfer handler does) so callers receive a retryable, actionable result.
+		switch {
+		case errors.Is(err, domain.ErrWalletNameRequired),
+			errors.Is(err, domain.ErrNegativeBalance),
+			errors.Is(err, domain.ErrCurrencyMismatch):
+			WriteError(w, http.StatusBadRequest, err.Error())
+```
+
+**Tools Executed**: `view_file` (10), `replace_file_content` (2), `run_command` (4)
+
+### AI Response / Outcome
+
+Created At: 2026-09-12T12:14:29+05:30
+Completed At: 2026-09-12T12:14:34+05:30
+
+The command exited with code 0.
+Stdout:
+
+Stderr:
 
 ---
 

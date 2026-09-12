@@ -48,7 +48,7 @@ Antigravity was employed as an active **pair programmer and systems design sound
 
 ## 3. Session Transcript & Prompt Records
 
-The complete transcript of all 53 interaction turns—including exact prompt text, tool invocations, and AI responses—is preserved in this repository:
+The complete transcript of all 54 interaction turns—including exact prompt text, tool invocations, and AI responses—is preserved in this repository:
 - **Readable Session Transcript**: [`AI_TRANSCRIPT.md`](./AI_TRANSCRIPT.md)
 - **Raw Agent Interaction Log**: Persisted in the session metadata logs.
 
@@ -56,7 +56,7 @@ The complete transcript of all 53 interaction turns—including exact prompt tex
 
 ## 4. Chronological List of All Prompts
 
-Below is the complete chronological log of all 53 explicit prompts provided during the development session:
+Below is the complete chronological log of all 54 explicit prompts provided during the development session:
 
 | # | Timestamp (UTC) | Phase | User Prompt |
 |---|---|---|---|
@@ -113,6 +113,7 @@ Below is the complete chronological log of all 53 explicit prompts provided duri
 | **51** | `2026-09-11 22:30:15` | Git & Commit | *push* |
 | **52** | `2026-09-11 22:35:10` | Review Fixes | *[Follow-up Review Feedback on PR #169 covering atomic multi-row ledger inserts, in-flight heartbeat lease cancellation, strict migration version lookup error handling, migration runner advisory locks, transfers table constraint triggers, and ledger immutability triggers]* |
 | **53** | `2026-09-11 22:41:41` | Git & Commit | *push the changes* |
+| **54** | `2026-09-12 06:42:19` | Review Fixes | *internal/handler/wallet_handler.go:35 When a requested initial balance exceeds the system treasury, WalletService.CreateWallet returns ErrInsufficientFunds, but this switch falls through to the generic 500 response. That is a normal business rejection rather than an internal failure; map it to a client/business status (for example 422, as the transfer handler does) so callers receive a retryable, actionable result.* |
 
 ---
 
