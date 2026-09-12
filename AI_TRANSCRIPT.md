@@ -2,7 +2,7 @@
 
 This document contains the chronological record of the interaction session with Google Antigravity during the development, testing, and refinement of the Wallet Transfer Service.
 
-- **Total Interaction Turns**: 56
+- **Total Interaction Turns**: 58
 - **Primary Tool**: Google Antigravity
 - **Underlying Model**: Advanced Agentic Reasoning Model
 
@@ -492,8 +492,10 @@ git commit -m "feat: implement transactional wallet transfer service with postgr
 
 ### User Request
 ```text
-problem_understanding.md:176
-
+problem_understanding.md:176
+
+
+
 Using a column named key in the proposed idempotency_records schema is inconsistent with the rest of the document (which uses idempotency_key) and tends to require awkward quoting in SQL; naming it idempotency_key improves clarity and consistency.
 ```
 
@@ -642,10 +644,14 @@ _Execution completed with tool actions._
 
 ### User Request
 ```text
-internal/domain/transfer.go:42
-
-The domain validation reports a missing idempotency key as ErrInvalidAmount, whose message says the amount is invalid. Any caller using Transfer.Validate would return the wrong failure reason for a missing key; add/use a dedicated invalid-idempotency-key error instead.
-	if t.IdempotencyKey == "" {
+internal/domain/transfer.go:42
+
+
+
+The domain validation reports a missing idempotency key as ErrInvalidAmount, whose message says the amount is invalid. Any caller using Transfer.Validate would return the wrong failure reason for a missing key; add/use a dedicated invalid-idempotency-key error instead.
+
+	if t.IdempotencyKey == "" {
+
 		return ErrInvalidAmount
 ```
 
@@ -713,9 +719,12 @@ ok      wallet-transfer-assignment/internal/service      2.696s
 
 ### User Request
 ```text
-internal/handler/wallet_handler.go:51
-
-This 500 response forwards the repository error text directly to clients, potentially exposing database details. Keep the error in server-side logs and return a generic internal-error response.
+internal/handler/wallet_handler.go:51
+
+
+
+This 500 response forwards the repository error text directly to clients, potentially exposing database details. Keep the error in server-side logs and return a generic internal-error response.
+
 		WriteError(w, http.StatusInternalServerError, err.Error())
 ```
 
@@ -767,13 +776,20 @@ ok      wallet-transfer-assignment/internal/service      2.744s
 
 ### User Request
 ```text
-internal/handler/wallet_handler.go:72
-
-This 500 response forwards the repository error text directly to clients, potentially exposing database details. Keep the error in server-side logs and return a generic internal-error response.
-		WriteError(w, http.StatusInternalServerError, err.Error())
-internal/handler/wallet_handler.go:93
-
-This 500 response forwards the repository error text directly to clients, potentially exposing database details. Keep the error in server-side logs and return a generic internal-error response.
+internal/handler/wallet_handler.go:72
+
+
+
+This 500 response forwards the repository error text directly to clients, potentially exposing database details. Keep the error in server-side logs and return a generic internal-error response.
+
+		WriteError(w, http.StatusInternalServerError, err.Error())
+
+internal/handler/wallet_handler.go:93
+
+
+
+This 500 response forwards the repository error text directly to clients, potentially exposing database details. Keep the error in server-side logs and return a generic internal-error response.
+
 		WriteError(w, http.StatusInternalServerError, err.Error())
 ```
 
@@ -845,13 +861,20 @@ All automated unit, integration, and HTTP tests continue to pass with 100% succe
 
 ### User Request
 ```text
-internal/repository/postgres/idempotency_repo.go:33
-
-The idempotency reservation is inserted in the same transaction as the entire transfer, so an overlapping request cannot see IN_PROGRESS: it waits on the unique-index conflict until the first transaction commits, then replays. Under duplicate-request bursts this holds a pool connection for the full transfer and contradicts the documented immediate in-flight 409; use a short committed reservation/lock protocol with explicit stale-owner recovery if immediate rejection is required.
-	insertQuery := `
-		INSERT INTO idempotency_records (idempotency_key, request_hash, status, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5)
-		ON CONFLICT (idempotency_key) DO NOTHING
+internal/repository/postgres/idempotency_repo.go:33
+
+
+
+The idempotency reservation is inserted in the same transaction as the entire transfer, so an overlapping request cannot see IN_PROGRESS: it waits on the unique-index conflict until the first transaction commits, then replays. Under duplicate-request bursts this holds a pool connection for the full transfer and contradicts the documented immediate in-flight 409; use a short committed reservation/lock protocol with explicit stale-owner recovery if immediate rejection is required.
+
+	insertQuery := `
+
+		INSERT INTO idempotency_records (idempotency_key, request_hash, status, created_at, updated_at)
+
+		VALUES ($1, $2, $3, $4, $5)
+
+		ON CONFLICT (idempotency_key) DO NOTHING
+
 		RETURNING idempotency_key
 ```
 
@@ -888,13 +911,20 @@ The short committed reservation protocol with explicit stale-owner recovery and 
 
 ### User Request
 ```text
-internal/service/transfer_service.go:45
-
-The idempotency record is consulted only after validating the full request. Reusing an existing key with a changed but invalid amount (or missing wallet ID) returns 400/404 instead of the documented 409 payload-conflict response, so the result depends on the new payload's validity. Resolve an existing key against a canonical request fingerprint before business-field validation, while still validating the key itself.
-	if req.Amount <= 0 {
-		return nil, domain.ErrInvalidAmount
-	}
-
+internal/service/transfer_service.go:45
+
+
+
+The idempotency record is consulted only after validating the full request. Reusing an existing key with a changed but invalid amount (or missing wallet ID) returns 400/404 instead of the documented 409 payload-conflict response, so the result depends on the new payload's validity. Resolve an existing key against a canonical request fingerprint before business-field validation, while still validating the key itself.
+
+	if req.Amount <= 0 {
+
+		return nil, domain.ErrInvalidAmount
+
+	}
+
+
+
 	requestHash := domain.ComputeRequestHash(req.FromWalletID, req.ToWalletID, req.Amount)
 ```
 
@@ -928,9 +958,12 @@ The idempotency resolution flow has been updated in [`internal/service/transfer_
 
 ### User Request
 ```text
-internal/service/transfer_service.go:82
-
-The documented IN_PROGRESS/409 path is not observable here: the idempotency row is inserted and finalized inside the same transaction, so concurrent reservations block on the unique index and then see COMPLETED or FAILED. This makes retries consume database connections until the original transaction finishes and contradicts the stated in-flight behavior; either separate/commit the reservation with crash recovery or document blocking/replay semantics.
+internal/service/transfer_service.go:82
+
+
+
+The documented IN_PROGRESS/409 path is not observable here: the idempotency row is inserted and finalized inside the same transaction, so concurrent reservations block on the unique index and then see COMPLETED or FAILED. This makes retries consume database connections until the original transaction finishes and contradicts the stated in-flight behavior; either separate/commit the reservation with crash recovery or document blocking/replay semantics.
+
 		reservedRecord, isNew, reserveErr := txRepos.Idempotency.ReserveIdempotency(ctx, record)
 ```
 
@@ -978,13 +1011,20 @@ The idempotency reservation architecture and documentation have been aligned to 
 
 ### User Request
 ```text
-internal/service/transfer_service.go:36
-
-These validation errors map to incorrect HTTP results: an empty idempotency key is an untyped error that the handler returns as 500, while missing wallet IDs are returned as ErrWalletNotFound and become 404. Both are malformed request data and should return 400, as specified by the API contract; use dedicated validation errors and map them accordingly.
-	if req.IdempotencyKey == "" {
-		return nil, errors.New("idempotencyKey is required")
-	}
-	if req.FromWalletID == "" || req.ToWalletID == "" {
+internal/service/transfer_service.go:36
+
+
+
+These validation errors map to incorrect HTTP results: an empty idempotency key is an untyped error that the handler returns as 500, while missing wallet IDs are returned as ErrWalletNotFound and become 404. Both are malformed request data and should return 400, as specified by the API contract; use dedicated validation errors and map them accordingly.
+
+	if req.IdempotencyKey == "" {
+
+		return nil, errors.New("idempotencyKey is required")
+
+	}
+
+	if req.FromWalletID == "" || req.ToWalletID == "" {
+
 		return nil, domain.ErrWalletNotFound
 ```
 
@@ -1027,9 +1067,12 @@ The request validation errors have been refactored to distinguish between **malf
 
 ### User Request
 ```text
-internal/service/transfer_service_test.go:329
-
-This concurrency test also waits on all database calls with context.Background() and no deadline. A regression that blocks a wallet row lock will make the test process hang indefinitely rather than report a failed double-spend test; bound the request context and wait with a timeout.
+internal/service/transfer_service_test.go:329
+
+
+
+This concurrency test also waits on all database calls with context.Background() and no deadline. A regression that blocks a wallet row lock will make the test process hang indefinitely rather than report a failed double-spend test; bound the request context and wait with a timeout.
+
 	wg.Wait()
 ```
 
@@ -1072,9 +1115,12 @@ The concurrency tests in [`internal/service/transfer_service_test.go`](file:///c
 
 ### User Request
 ```text
-migrations/000001_init_schema.sql:1
-
-postgres.Migrate embeds and executes internal/repository/postgres/schema.sql; this migration file is never applied by the application. Keeping two schema sources means a future change here can be silently absent from runtime and tests. Use one migration source or make startup execute this migration set.
+migrations/000001_init_schema.sql:1
+
+
+
+postgres.Migrate embeds and executes internal/repository/postgres/schema.sql; this migration file is never applied by the application. Keeping two schema sources means a future change here can be silently absent from runtime and tests. Use one migration source or make startup execute this migration set.
+
 -- Migration 000001: Initial schema for Wallet Transfer Service
 ```
 
@@ -2402,13 +2448,20 @@ Whenever you're ready, I can commit these changes and push them to your branch!
 
 ### User Request
 ```text
-AI disclosure
-Detail how you used AI to help with your submission (including the tools you used, how
-you used them and what your prompts were).
-Include these points in detail
-
-What tool you used (Cursor, Claude Code, Antigratvity etc.)
-How you generally use the tool for your work.
+AI disclosure
+
+Detail how you used AI to help with your submission (including the tools you used, how
+
+you used them and what your prompts were).
+
+Include these points in detail
+
+
+
+What tool you used (Cursor, Claude Code, Antigratvity etc.)
+
+How you generally use the tool for your work.
+
 A transcript of your entire session with your AI tool of choice. You can add this to the repo or email it to us with your submission. If for some reason, this is not possible, give us all the prompts that you used with the AI.
 
 create a .md file to tell this also or give me a transcript which i send the interviewer
@@ -2800,26 +2853,46 @@ Working tree is clean, all tests pass with 0 failures, and the remote PR branch 
 
 ### User Request
 ```text
-internal/repository/postgres/ledger_repo.go:60
-
-This loop assumes db is an open transaction, but NewLedgerRepository(pool) is also supported and WalletService uses that repository when txManager is nil. Each pool Exec autocommits; with the deferred pair trigger the first row is rejected before the second is inserted, and without the trigger a later error could leave a partial pair. Make pair insertion atomic or require a transaction for this method.
-	for _, entry := range entries {
-		id := entry.ID
-		if id == "" {
-			id = uuid.NewString()
-		}
-internal/service/transfer_service.go:179
-
-Heartbeat failures, including ErrIdempotencyLeaseLost, are discarded, so a worker whose reservation has been reclaimed continues through the full wallet transaction and only discovers the fencing loss at finalization. During that time it can hold wallet locks and block the replacement owner, creating avoidable duplicate work and contention. Treat lease loss as cancellation of the in-flight operation (while handling transient heartbeat errors separately).
-			case <-ticker.C:
-				_ = s.repos.Idempotency.HeartbeatIdempotency(ctx, req.IdempotencyKey, ownerToken)
-			}
-migrations/migrations.go:48
-
-Every error from the version lookup is treated as if the row were absent. A timeout, permission error, or lost connection therefore proceeds into migration execution instead of being reported as a lookup failure, producing misleading DDL or duplicate-version errors. Handle pgx.ErrNoRows as the not-applied case and return all other errors.
-problem_understanding.md:179
-The schema shown in this document omits the from_wallet_id <> to_wallet_id check required by the functional requirements and present in the actual migration. A reader applying this DDL could create self-transfers; keep the documented schema aligned with the migration.
-problem_understanding.md:258
+internal/repository/postgres/ledger_repo.go:60
+
+
+
+This loop assumes db is an open transaction, but NewLedgerRepository(pool) is also supported and WalletService uses that repository when txManager is nil. Each pool Exec autocommits; with the deferred pair trigger the first row is rejected before the second is inserted, and without the trigger a later error could leave a partial pair. Make pair insertion atomic or require a transaction for this method.
+
+	for _, entry := range entries {
+
+		id := entry.ID
+
+		if id == "" {
+
+			id = uuid.NewString()
+
+		}
+
+internal/service/transfer_service.go:179
+
+
+
+Heartbeat failures, including ErrIdempotencyLeaseLost, are discarded, so a worker whose reservation has been reclaimed continues through the full wallet transaction and only discovers the fencing loss at finalization. During that time it can hold wallet locks and block the replacement owner, creating avoidable duplicate work and contention. Treat lease loss as cancellation of the in-flight operation (while handling transient heartbeat errors separately).
+
+			case <-ticker.C:
+
+				_ = s.repos.Idempotency.HeartbeatIdempotency(ctx, req.IdempotencyKey, ownerToken)
+
+			}
+
+migrations/migrations.go:48
+
+
+
+Every error from the version lookup is treated as if the row were absent. A timeout, permission error, or lost connection therefore proceeds into migration execution instead of being reported as a lookup failure, producing misleading DDL or duplicate-version errors. Handle pgx.ErrNoRows as the not-applied case and return all other errors.
+
+problem_understanding.md:179
+
+The schema shown in this document omits the from_wallet_id <> to_wallet_id check required by the functional requirements and present in the actual migration. A reader applying this DDL could create self-transfers; keep the documented schema aligned with the migration.
+
+problem_understanding.md:258
+
 This paragraph states that the database trigger independently guarantees exactly one matching pair for every transfer, but the migration trigger is only at
 <truncated 2168 bytes>
 edger_entries, so it runs only when an entry is inserted or updated. A caller can insert a PROCESSED transfer (or transition PENDING to PROCESSED) with zero ledger rows and commit successfully, contradicting the documented invariant that every transfer has exactly one debit and one credit. Add a deferred check on transfer creation/status transitions, or otherwise guard the transition until the pair exists.
@@ -2890,13 +2963,20 @@ All changes addressing the latest code review comments have been verified, commi
 
 ### User Request
 ```text
-internal/handler/wallet_handler.go:35
-
-When a requested initial balance exceeds the system treasury, WalletService.CreateWallet returns ErrInsufficientFunds, but this switch falls through to the generic 500 response. That is a normal business rejection rather than an internal failure; map it to a client/business status (for example 422, as the transfer handler does) so callers receive a retryable, actionable result.
-		switch {
-		case errors.Is(err, domain.ErrWalletNameRequired),
-			errors.Is(err, domain.ErrNegativeBalance),
-			errors.Is(err, domain.ErrCurrencyMismatch):
+internal/handler/wallet_handler.go:35
+
+
+
+When a requested initial balance exceeds the system treasury, WalletService.CreateWallet returns ErrInsufficientFunds, but this switch falls through to the generic 500 response. That is a normal business rejection rather than an internal failure; map it to a client/business status (for example 422, as the transfer handler does) so callers receive a retryable, actionable result.
+
+		switch {
+
+		case errors.Is(err, domain.ErrWalletNameRequired),
+
+			errors.Is(err, domain.ErrNegativeBalance),
+
+			errors.Is(err, domain.ErrCurrencyMismatch):
+
 			WriteError(w, http.StatusBadRequest, err.Error())
 ```
 
@@ -2926,34 +3006,62 @@ The review comment has been resolved, verified with unit tests, committed, and p
 
 ### User Request
 ```text
-internal/repository/postgres/ledger_repo.go:120
-
-created_at is only a partial ordering key: PostgreSQL timestamps have finite precision, so concurrent ledger inserts can share the same value and be returned in arbitrary order. This makes the wallet audit-history API nondeterministic and can also make the tests that inspect a fixed index flaky. Add a unique tie-breaker to the ordering.
-		ORDER BY created_at ASC
-internal/service/transfer_service.go:395
-
-The lease-loss check races with the final transaction commit. A heartbeat can already be blocked on this idempotency row; after this transaction commits it observes status <> IN_PROGRESS, sets leaseLostErr, and this branch returns ErrIdempotencyLeaseLost even though the balances, ledger, and COMPLETED record were committed. Stop and join the heartbeat before deciding the result, and treat a successful commit as authoritative (or otherwise coordinate finalization).
-	leaseMu.Lock()
-	lost := leaseLostErr
-	leaseMu.Unlock()
-	if lost != nil {
-		return nil, domain.ErrIdempotencyLeaseLost
-internal/service/transfer_service.go:243
-
-Cancelling txCtx in the heartbeat does not cancel the database operations in this callback: the FOR UPDATE call, and all subsequent repository calls, receive the parent ctx instead. A lost lease can therefore leave a blocked transaction holding wallet locks until the request context ends, defeating the claimed immediate cancellation and contending with the reclaimer. Pass txCtx through every repository call in the transaction callback.
-		wallet1, lockErr1 := txRepos.Wallets.GetWalletByIDForUpdate(ctx, firstID)
-internal/service/transfer_service.go:57
-
-After this lookup returns nil, the service performs wallet preflight before calling ReserveIdempotency. A concurrent request can reserve the same key in that gap; if this request has an invalid or missing wallet/amount, it returns 400/404 instead of the documented 409 conflict/in-progress result. Make ownership resolution atomic before validation, or recheck the key before returning validation errors, so concurrent reuses have the same precedence as sequential ones.
-	existing, err := s.repos.Idempotency.GetIdempotency(ctx, req.IdempotencyKey)
-	if err != nil {
-		return nil, fmt.Errorf("error resolving idempotency record: %w", err)
-internal/service/transfer_service.go:227
-
-This cleanup runs for every non-successful ExecuteInTx result, but TxManager also returns an error when Commit cannot report its result. PostgreSQL may have committed the debit before a network or context error is observed; deleting the only IN_PROGRESS record here lets a retry reserve the key and execute a second transfer. Keep the reservation for commit-ambiguous failures and resolve/reconcile its outcome before allowing a new owner.
-		if !success {
-			cleanupCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-			defer cancel()
+internal/repository/postgres/ledger_repo.go:120
+
+
+
+created_at is only a partial ordering key: PostgreSQL timestamps have finite precision, so concurrent ledger inserts can share the same value and be returned in arbitrary order. This makes the wallet audit-history API nondeterministic and can also make the tests that inspect a fixed index flaky. Add a unique tie-breaker to the ordering.
+
+		ORDER BY created_at ASC
+
+internal/service/transfer_service.go:395
+
+
+
+The lease-loss check races with the final transaction commit. A heartbeat can already be blocked on this idempotency row; after this transaction commits it observes status <> IN_PROGRESS, sets leaseLostErr, and this branch returns ErrIdempotencyLeaseLost even though the balances, ledger, and COMPLETED record were committed. Stop and join the heartbeat before deciding the result, and treat a successful commit as authoritative (or otherwise coordinate finalization).
+
+	leaseMu.Lock()
+
+	lost := leaseLostErr
+
+	leaseMu.Unlock()
+
+	if lost != nil {
+
+		return nil, domain.ErrIdempotencyLeaseLost
+
+internal/service/transfer_service.go:243
+
+
+
+Cancelling txCtx in the heartbeat does not cancel the database operations in this callback: the FOR UPDATE call, and all subsequent repository calls, receive the parent ctx instead. A lost lease can therefore leave a blocked transaction holding wallet locks until the request context ends, defeating the claimed immediate cancellation and contending with the reclaimer. Pass txCtx through every repository call in the transaction callback.
+
+		wallet1, lockErr1 := txRepos.Wallets.GetWalletByIDForUpdate(ctx, firstID)
+
+internal/service/transfer_service.go:57
+
+
+
+After this lookup returns nil, the service performs wallet preflight before calling ReserveIdempotency. A concurrent request can reserve the same key in that gap; if this request has an invalid or missing wallet/amount, it returns 400/404 instead of the documented 409 conflict/in-progress result. Make ownership resolution atomic before validation, or recheck the key before returning validation errors, so concurrent reuses have the same precedence as sequential ones.
+
+	existing, err := s.repos.Idempotency.GetIdempotency(ctx, req.IdempotencyKey)
+
+	if err != nil {
+
+		return nil, fmt.Errorf("error resolving idempotency record: %w", err)
+
+internal/service/transfer_service.go:227
+
+
+
+This cleanup runs for every non-successful ExecuteInTx result, but TxManager also returns an error when Commit cannot report its result. PostgreSQL may have committed the debit before a network or context error is observed; deleting the only IN_PROGRESS record here lets a retry reserve the key and execute a second transfer. Keep the reservation for commit-ambiguous failures and resolve/reconcile its outcome before allowing a new owner.
+
+		if !success {
+
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+
+			defer cancel()
+
 			_ = s.repos.Idempotency.DeleteInProgress(cleanupCtx, req.IdempotencyKey, ownerToken)
 ```
 
@@ -3027,17 +3135,446 @@ line 391
 resolve this also then push
 ```
 
-**Tools Executed**: `view_file` (10), `replace_file_content` (4), `run_command` (4)
+**Tools Executed**: `view_file` (11), `replace_file_content` (6), `run_command` (10)
 
 ### AI Response / Outcome
 
-Created At: 2026-09-12T12:28:20+05:30
-Completed At: 2026-09-12T12:28:26+05:30
+All review comments including the heartbeat failure tracking have been resolved, verified with comprehensive tests, committed, and pushed to `origin/solution/udbhav-prakash`.
 
-The command exited with code 0.
-Stdout:
+### Summary of Changes (`commit 006cf04`)
 
-Stderr:
+1. **Heartbeat Failure Tracking & Reliable Lease Health ([`internal/service/transfer_service.go`](file:///c:/Go/src/wallet-transfer-assignment/internal/service/transfer_service.go#L225-L270))**:
+   - **Track Consecutive & Temporal Failures**: Heartbeat errors beyond `ErrIdempotencyLeaseLost` (such as database timeouts, connection drops, or query failures) are no longer ignored.
+   - **Proactive In-Flight Abort**: If heartbeats fail repeatedly (`consecutiveFailures >= 2` or `time.Since(lastHeartbeatSuccess) >= staleTimeout/2`), the worker recognizes that the lease cannot be refreshed reliably. It immediately triggers `cancelTx()`, terminating in-flight database operations and releasing wallet row locks before the 30-second stale window expires and another worker reclaims the lease.
+   - **Error Propagation**: Heartbeat errors and lease loss are captured and returned when the transaction aborts, ensuring operational issues are clearly reported rather than swallowed.
+   - **Automated Verification**: Added `TestTransferService_HeartbeatFailure_AbortsTransaction` in `transfer_service_test.go`.
+
+2. **Stop and Join Heartbeat Before Deciding Result & Authoritative Commit ([`internal/service/transfer_service.go`](file:///c:/Go/src/wallet-transfer-assignment/internal/service/transfer_service.go#L440-L450))**:
+   - Stopped and joined the heartbeat goroutine (`stopAndJoinHeartbeat()`) before evaluating the outcome.
+   - A successful commit (`txErr == nil`) is authoritative, eliminating the race where post-commit ticker ticks could observe `status <> IN_PROGRESS` and return a false lease loss.
+
+3. **Context Cancellation Propagation via `txCtx` ([`internal/service/transfer_service.go`](file:///c:/Go/src/wallet-transfer-assignment/internal/service/transfer_service.go#L275-L425))**:
+   - Passed `txCtx` through all
+<truncated 306 bytes>
+dempotency Recheck ([`internal/service/transfer_service.go`](file:///c:/Go/src/wallet-transfer-assignment/internal/service/transfer_service.go#L95-L140))**:
+   - Wrapped preflight validation failures in `checkValidationErr()`. If validation fails, it re-queries `GetIdempotency(ctx, key)` so concurrent requests reserving the key in that window receive `409 Conflict` or `409 In Progress` with the exact same precedence as sequential requests.
+   - Verified with `TestTransferService_PreflightRecheck_ConcurrentIdempotency`.
+
+5. **Commit-Ambiguity Reservation Preservation & Reconciliation ([`internal/service/transfer_service.go`](file:///c:/Go/src/wallet-transfer-assignment/internal/service/transfer_service.go#L250-L260), [L460-L495](file:///c:/Go/src/wallet-transfer-assignment/internal/service/transfer_service.go#L460-L495))**:
+   - Tracked `txCompleted`. Deferred cleanup only deletes reservations if operations aborted prior to commit (`!success && !txCompleted`).
+   - If operations completed but commit reported an ambiguous failure, the service checks PostgreSQL: if committed, it returns success; if confirmed rolled back, it deletes the reservation; if ambiguous (e.g. database unreachable), it keeps `IN_PROGRESS` to prevent double-spending retries.
+   - Verified with `TestTransferService_CommitAmbiguity_PreservesReservation`.
+
+6. **Deterministic Ledger Tie-Breaker ([`internal/repository/postgres/ledger_repo.go`](file:///c:/Go/src/wallet-transfer-assignment/internal/repository/postgres/ledger_repo.go#L115-L122))**:
+   - Appended `id ASC` to `ORDER BY created_at ASC` (`ORDER BY created_at ASC, id ASC`), ensuring deterministic ordering when concurrent ledger entries share timestamp values.
+   - Verified with `TestLedgerRepository_DeterministicOrdering_TieBreaker`.
+
+7. **Documentation & AI Disclosure Sync**:
+   - Regenerated [`AI_TRANSCRIPT.md`](file:///c:/Go/src/wallet-transfer-assignment/AI_TRANSCRIPT.md) and updated [`AI_DISCLOSURE.md`](file:///c:/Go/src/wallet-transfer-assignment/AI_DISCLOSURE.md) reflecting turn 56.
 
 ---
+
+## Turn 57 — 2026-09-12T07:39:02Z
+
+### User Request
+```text
+internal/handler/wallet_handler.go:35
+
+
+
+When a requested initial balance exceeds the system treasury, WalletService.CreateWallet returns ErrInsufficientFunds, but this switch falls through to the generic 500 response. That is a normal business rejection rather than an internal failure; map it to a client/business status (for example 422, as the transfer handler does) so callers receive a retryable, actionable result.
+
+		switch {
+
+		case errors.Is(err, domain.ErrWalletNameRequired),
+
+			errors.Is(err, domain.ErrNegativeBalance),
+
+			errors.Is(err, domain.ErrCurrencyMismatch):
+
+			WriteError(w, http.StatusBadRequest, err.Error())
+
+dont push anything
+```
+
+**Tools Executed**: `view_file` (3), `run_command` (6), `grep_search` (1), `manage_task` (4)
+
+### AI Response / Outcome
+
+This issue was already resolved, verified with unit tests, and committed. Per your instruction ("dont push anything"), **nothing has been pushed**.
+
+Here is the current implementation in [`internal/handler/wallet_handler.go`](file:///c:/Go/src/wallet-transfer-assignment/internal/handler/wallet_handler.go#L30-L52):
+
+```go
+	wallet, err := h.walletService.CreateWallet(r.Context(), req)
+	if err != nil {
+		switch {
+		case errors.Is(err, domain.ErrWalletNameRequired),
+			errors.Is(err, domain.ErrNegativeBalance),
+			errors.Is(err, domain.ErrCurrencyMismatch),
+			errors.Is(err, domain.ErrBalanceOverflow):
+			WriteError(w, http.StatusBadRequest, err.Error())
+			return
+
+		case errors.Is(err, domain.ErrInsufficientFunds):
+			WriteError(w, http.StatusUnprocessableEntity, err.Error())
+			return
+
+		case errors.Is(err, domain.ErrWalletAlreadyExists):
+			WriteError(w, http.StatusConflict, err.Error())
+			return
+
+		default:
+			log.Printf("[ERROR] failed to create wallet: %v", err)
+			WriteError(w, http.StatusInternalServerError, "internal server error")
+			return
+		}
+	}
+```
+
+### Verification
+The automated test [`TestHandler_CreateWallet_InsufficientTreasuryFunds`](file:///c:/Go/src/wallet-transfer-assignment/internal/handler/handler_test.go#L560-L577) in `internal/handler/handler_test.go` directly exercises this path:
+
+```go
+func TestHandler_CreateWallet_InsufficientTreasuryFunds(t *testing.T) {
+	router := setupTestServer(t)
+
+	// Treasury balance is 100_000_000_000_000; requesting more must return 422 Unprocessable Entity
+	body, _ := json.Marshal(service.CreateWalletRequest{
+		ID:             "wallet_excessive_funds",
+		Name:           "Billionaire Wallet",
+		InitialBalance: 100000000000001,
+	})
+	req := httptest.NewRequest(http.MethodPost, "/wallets", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422 Unprocessable Entity for initial balance exceeding treasury, got %d: %s", w.Code, w.Body.String())
+	}
+}
+```
+
+```text
+=== RUN   TestHandler_CreateWallet_InsufficientTreasuryFunds
+--- PASS: TestHandler_CreateWallet_InsufficientTreasuryFunds (0.10s)
+PASS
+ok      wallet-transfer-assignment/internal/handler     1.407s
+```
+
+Everything is fully in place and working properly. No git operations or pushes were executed.
+
+---
+
+## Turn 58 — 2026-09-12T07:45:09Z
+
+### User Request
+```text
+In [internal/config/config.go](https://github.com/Robustrade/wallet-transfer-assignment/pull/169#discussion_r3995500924):
+> + dbURL := os.Getenv("DATABASE_URL") + if dbURL == "" { + dbURL = "postgres://postgres:postgrespassword@localhost:5432/wallet_db?sslmode=disable"
+When DATABASE_URL is omitted, the service silently runs with a committed, known PostgreSQL superuser credential. An accidental deployment outside the local development setup therefore gives the API full database privileges with a predictable password. Require an explicitly configured URL in non-development environments and use a least-privileged application role instead of a runtime default superuser connection.
+```
+
+**Tools Executed**: `view_file` (14), `grep_search` (2), `run_command` (7), `replace_file_content` (4), `write_to_file` (2)
+
+### AI Response / Outcome
+
+The review feedback regarding superuser credentials and non-development database URL enforcement has been resolved:
+
+1. **Explicit `DATABASE_URL` Requirement in Non-Development Environments ([`internal/config/config.go`](file:///c:/Go/src/wallet-transfer-assignment/internal/config/config.go))**:
+   - `config.Load()` inspects `APP_ENV` / `ENV` (defaults to `"development"`).
+   - If the environment is non-development (`production`, `staging`, `prod`, etc.) and `DATABASE_URL` is empty, `config.Load()` fails fast and returns `ErrMissingDatabaseURL`:
+     ```go
+     if isNonDevelopment(env) {
+         return nil, fmt.Errorf("%w (environment: %s)", ErrMissingDatabaseURL, env)
+     }
+     ```
+   - In `cmd/api/main.go`, `config.Load()` errors are checked immediately at startup, terminating with `log.Fatalf("Configuration error: %v", err)`.
+
+2. **Least-Privileged Application Role (`wallet_app`) for Development**:
+   - In local development, the fallback `DATABASE_URL` no longer connects with the PostgreSQL superuser (`postgres`).
+   - Instead, it connects as a dedicated, least-privileged application user:
+     ```text
+     postgres://wallet_app:wallet_app_password@localhost:5432/wallet_db?sslmode=disable
+     ```
+   - Created [`scripts/init-user.sql`](file:///c:/Go/src/wallet-transfer-assignment/scripts/init-user.sql) and mounted it in `docker-compose.yml` (`/docker-entrypoint-initdb.d/init-user.sql`) to provision the `wallet_app` role with standard schema privileges (preventing `pg_read_file`, database dropping, or superuser privilege escalation).
+   - Added an idempotent `DO $$` role provisioning block in [`migrations/000001_init_schema.sql`](file:///c:/Go/src/wallet-transfer-assignment/migrations/000001_init_schema.sql) with an exception handler for restricted environments.
+
+3. **Automated Verification**:
+   - Added unit tests in [`internal/config/config_test.go`](file:///c:/Go/src/wallet-transfer-assignment/internal/config/config_test.go):
+     - `TestConfig_Load_DevelopmentDefaults`: Asserts default fallback uses `wallet_app` and port 8080.
+     - `TestConfig_Load_CustomDatabaseURL`: Asserts custom `DATABASE_URL` is respected.
+     - `TestConfig_Load_ProductionRequiresExplicitDatabaseURL`: Asserts `ErrMissingDatabaseURL` is returned when `APP_ENV=production` or `staging` without `DATABASE_URL`.
+     - `TestConfig_Load_ProductionWithExplicitDatabaseURL`: Asserts explicit `DATABASE_URL` works in production.
+   - All package tests (`go test -count=1 ./...`) and linters (`go vet ./...`) pass cleanly.
+
+---
+
+## Turn 59 — 2026-09-12T07:54:08Z
+
+### User Request
+```text
+In [internal/repository/postgres/idempotency_repo.go](https://github.com/Robustrade/wallet-transfer-assignment/pull/169#discussion_r3995500941):
+> + } + + if errors.Is(err, pgx.ErrNoRows) { + // Conflict: key already exists. Fetch the existing record. + existing, getErr := r.GetIdempotency(ctx, record.IdempotencyKey) + if getErr != nil { + return nil, false, fmt.Errorf("failed to fetch conflicting idempotency record: %w", getErr) + } + if existing == nil { + return nil, false, fmt.Errorf("idempotency record disappeared during reservation") + } + + // Explicit stale-owner recovery with owner token fencing: + // If existing record is IN_PROGRESS and hasn't been updated for longer than staleTimeout, + // the previous owner likely crashed or timed out. Attempt to reclaim it atomically. + if staleTimeout > 0 && existing.Status == domain.IdempotencyStatusInProgress && now.Sub(existing.UpdatedAt) > staleTimeout {
+This stale-reclaim path does not verify that the existing reservation has the same request hash. If two callers both observe a missing key and another payload wins the reservation before this call, a stale record for that other payload is overwritten and the caller is allowed to execute under the same idempotency key instead of receiving a conflict. Require existing.RequestHash == record.RequestHash before reclaiming (or include it in the UPDATE predicate).
+```
+
+**Tools Executed**: `view_file` (7), `grep_search` (2), `replace_file_content` (2), `run_command` (4)
+
+### AI Response / Outcome
+
+The review feedback regarding stale idempotency reservation reclaim and request hash validation has been resolved:
+
+1. **Enforce Matching Request Hash Before Stale Reclaim ([`internal/repository/postgres/idempotency_repo.go`](file:///c:/Go/src/wallet-transfer-assignment/internal/repository/postgres/idempotency_repo.go#L64-L101))**:
+   - In `ReserveIdempotency`, added an explicit check `existing.RequestHash == record.RequestHash` before attempting to reclaim an `IN_PROGRESS` reservation that has exceeded `staleTimeout`:
+     ```go
+     if staleTimeout > 0 &&
+         existing.Status == domain.IdempotencyStatusInProgress &&
+         existing.RequestHash == record.RequestHash &&
+         now.Sub(existing.UpdatedAt) > staleTimeout {
+     ```
+   - If the existing reservation has a different `RequestHash`, stale reclaim is bypassed entirely and returns `(existing, false, nil)`.
+   - In `TransferService.ExecuteTransfer`, observing `reservedRecord.RequestHash != requestHash` immediately returns `domain.ErrIdempotencyConflict` (HTTP 409 Conflict), preventing callers with differing payloads from overwriting stale reservations.
+
+2. **Database-Level Atomic UPDATE Predicate Fencing**:
+   - Included `AND request_hash = $5` directly in the atomic `reclaimQuery` SQL predicate:
+     ```sql
+     UPDATE idempotency_records
+     SET owner_token = $1, status = $2, updated_at = $3
+     WHERE idempotency_key = $4 AND request_hash = $5 AND status = 'IN_PROGRESS' AND updated_at <= $6
+     RETURNING idempotency_key
+     ```
+   - Guarantees at the database level that even under race conditions, a stale reservation can never be reclaimed or modified by a request with a differing request hash.
+   - Removed `request_hash = $1` from `SET` because request hashes for the key must remain immutable once created.
+
+3. **Automated Verification ([`internal/service/transfer_service_test.go`](file:///c:/Go/src/wallet-transfer-assignment/internal/service/transfer_service_test.go))**:
+   - `TestTransferService_StaleOwnerRecovery_DifferentPayload_ReturnsConflict`: Verifies that attempting to execute a transfer with a different payload on a key that holds a stale `IN_PROGRESS` reservation returns `domain.ErrIdempotencyConflict`, does not overwrite the record in the database, and leaves wallet balances untouched.
+   - `TestIdempotencyRepo_StaleReclaim_RequiresMatchingRequestHash`: Directly tests `ReserveIdempotency`, verifying that callers with differing hashes fail to reclaim (`isOwner = false`) and do not modify the database row, while retries with matching hashes successfully reclaim ownership (`isOwner = true`).
+   - Full test suite (`go test ./...`) and linter (`go vet ./...`) pass cleanly with 0 errors.
+
+---
+
+## Turn 60 — 2026-09-12T07:58:30Z
+
+### User Request
+```text
+In [internal/service/transfer_service.go](https://github.com/Robustrade/wallet-transfer-assignment/pull/169#discussion_r3995500957):
+> + _ = s.repos.Idempotency.UpdateIdempotency(reconcileCtx, rec) + success = true + return finalResponse, nil
+If this fenced finalization fails, this branch still marks the operation as successful and returns the processed response. The idempotency row can remain IN_PROGRESS, so a later retry may pass stale recovery and execute a second transfer; propagate the update error and keep the reservation for recovery instead of returning success
+```
+
+**Tools Executed**: `view_file` (10), `grep_search` (2), `replace_file_content` (5), `run_command` (7)
+
+### AI Response / Outcome
+
+The review feedback regarding error propagation and reservation retention during commit-ambiguity idempotency finalization has been resolved:
+
+1. **Propagate `UpdateIdempotency` Error & Disarm `success = true` ([`internal/service/transfer_service.go`](file:///c:/Go/src/wallet-transfer-assignment/internal/service/transfer_service.go#L552-L585))**:
+   - In `ExecuteTransfer`, during commit-ambiguity reconciliation where the underlying transfer committed in PostgreSQL, the result of `UpdateIdempotency(reconcileCtx, rec)` is now explicitly checked:
+     ```go
+     if updateErr := s.repos.Idempotency.UpdateIdempotency(reconcileCtx, rec); updateErr != nil {
+         if errors.Is(updateErr, domain.ErrIdempotencyLeaseLost) {
+             return nil, domain.ErrIdempotencyLeaseLost
+         }
+         return nil, fmt.Errorf("failed to finalize idempotency record: %w", updateErr)
+     }
+     success = true
+     return finalResponse, nil
+     ```
+   - Handled both `domain.TransferStatusProcessed` and `domain.TransferStatusFailed` branches identically.
+   - If `UpdateIdempotency` fails (e.g. database timeout or lost lease), `success = true` is NOT set, and the error is returned to the caller.
+   - Because `txCompleted == true`, deferred cleanup does not delete the reservation, keeping the `IN_PROGRESS` reservation intact in PostgreSQL for future recovery rather than leaving an unfinalized state masked as success.
+
+2. **Committed Transfer Recovery on Stale Retry ([`internal/service/transfer_service.go`](file:///c:/Go/src/wallet-transfer-assignment/internal/service/transfer_service.go#L86-L125))**:
+   - In `ExecuteTransfer`, when an existing reservation is `IN_PROGRESS` and has exceeded `staleTimeout`, the service queries `s.repos.Transfers.GetTransferByIdempotencyKey(ctx, req.IdempotencyKey)` before attempting a second execution or reclaim.
+   - If a transfer was already committed in PostgreSQL by a previous worker that crashed before updating `idempotency_records`, the service reconciles the idempotency record, marks `IsReplay = true`, and returns the cached result without ever executing a duplicate transfer or debiting balances again.
+   - `cleanupStaleReservation` similarly checks `GetTransferByIdempotencyKey` to ensure an in-progress reservation is never deleted if an underlying transfer was committed.
+
+3. **Automated Verification ([`internal/service/transfer_service_test.go`](file:///c:/Go/src/wallet-transfer-assignment/internal/service/transfer_service_test.go#L1620-L1740))**:
+   - Added `TestTransferService_CommitAmbiguity_UpdateIdempotencyFailure_PropagatesErrorAndEnablesRecovery`:
+     - Simulates an ambiguous commit where `transfers` commits in PostgreSQL but `idempotency_records` remains `IN_PROGRESS`.
+     - Injects a simulated network failure during `UpdateIdempotency` in reconciliation.
+     - Asserts `ExecuteTransfer` fails and returns the finalization error instead of masking as success.
+     - Asserts the reservation remains `IN_PROGRESS` in the database.
+     - Simulates network recovery and a subsequent client retry, asserting that the retry successfully recovers the committed transfer (`Status: PROCESSED`, `IsReplay: true`) and debits wallet balances only once.
+   - All tests (`go test -count=1 ./...`) and linters (`go vet ./...`) pass cleanly with 0 errors.
+
+---
+
+## Turn 61 — 2026-09-12T08:02:27Z
+
+### User Request
+```text
+In [internal/service/transfer_service.go](https://github.com/Robustrade/wallet-transfer-assignment/pull/169#discussion_r3995500978):
+> + return &cachedResp, domain.ErrInsufficientFunds + } + return &cachedResp, nil + } + } else if rec.Status == domain.IdempotencyStatusInProgress { + transfer, tErr := s.repos.Transfers.GetTransferByID(reconcileCtx, transferID) + if tErr == nil && transfer != nil && transfer.Status == domain.TransferStatusProcessed { + rec.Status = domain.IdempotencyStatusCompleted + rec.TransferID = &transfer.ID + rec.ResponseCode = http.StatusCreated + rec.ResponseBody = string(respBytes) + rec.OwnerToken = ownerToken + _ = s.repos.Idempotency.UpdateIdempotency(reconcileCtx, rec) + success = true + return finalResponse, nil + } else if errors.Is(tErr, domain.ErrWalletNotFound) || errors.Is(tErr, pgx.ErrNoRows) || transfer == nil {
+GetTransferByID returns a nil transfer for operational errors as well as not-found errors, so transfer == nil treats an unavailable database/read during commit-ambiguity reconciliation as proof that the transaction rolled back. That deletes the reservation and permits a retry while the original outcome is still unknown, which can duplicate a debit. Only delete after an explicit ErrTransferNotFound/pgx.ErrNoRows; retain the reservation for all other errors.
+```
+
+**Tools Executed**: `view_file` (7), `replace_file_content` (3), `run_command` (5)
+
+### AI Response / Outcome
+
+The review feedback regarding ambiguous commit reconciliation and strict rollback confirmation has been resolved:
+
+1. **Strict Rollback Confirmation via `ErrTransferNotFound` / `pgx.ErrNoRows` ([`internal/service/transfer_service.go`](file:///c:/Go/src/wallet-transfer-assignment/internal/service/transfer_service.go#L585-L589))**:
+   - In `ExecuteTransfer`, during commit-ambiguity reconciliation, previously `errors.Is(tErr, domain.ErrWalletNotFound) || errors.Is(tErr, pgx.ErrNoRows) || transfer == nil` was used.
+   - Because `GetTransferByID` returns `nil, err` on any operational database error (timeouts, connection drops, network partitions), `transfer == nil` erroneously treated temporary database outages as proof of a transaction rollback and deleted the reservation.
+   - Replaced this with an explicit check for non-existence:
+     ```go
+     } else if errors.Is(tErr, domain.ErrTransferNotFound) || errors.Is(tErr, pgx.ErrNoRows) {
+         // Confirmed rolled back: safe to delete in-progress reservation
+         _ = s.repos.Idempotency.DeleteInProgress(reconcileCtx, req.IdempotencyKey, ownerToken)
+     }
+     // If status is still ambiguous (e.g. operational DB error or timeout), keep the reservation intact!
+     ```
+   - All other operational errors retain the `IN_PROGRESS` reservation in PostgreSQL, preventing retries from duplicating debits while the transfer outcome remains unknown.
+
+2. **Automated Verification ([`internal/service/transfer_service_test.go`](file:///c:/Go/src/wallet-transfer-assignment/internal/service/transfer_service_test.go#L1730-L1865))**:
+   - `TestTransferService_CommitAmbiguity_GetTransferOperationalError_RetainsReservation`:
+     - Simulates an ambiguous commit followed by an operational database error (timeout/network error) during `GetTransferByID`.
+     - Verifies `ExecuteTransfer` fails with the commit error.
+     - Confirms the idempotency reservation is NOT deleted, remaining `IN_PROGRESS` in the database.
+   - `TestTransferService_CommitAmbiguity_ConfirmedRollback_DeletesReservation`:
+     - Simulates an ambiguous commit where the transaction rolled back in PostgreSQL (`GetTransferByID` returns `ErrTransferNotFound`).
+     - Confirms the `IN_PROGRESS` reservation is safely deleted so clients can retry cleanly.
+   - All tests (`go test -count=1 ./...`) and linters (`go vet ./...`) pass cleanly with 0 errors.
+
+---
+
+## Turn 62 — 2026-09-12T08:15:27Z
+
+### User Request
+```text
+In [internal/service/wallet_service.go](https://github.com/Robustrade/wallet-transfer-assignment/pull/169#discussion_r3995500992):
+> + if req.InitialBalance > 0 { + var err error + treasury, err = repos.Wallets.GetWalletByIDForUpdate(ctx, "system_treasury") + if err != nil { + return fmt.Errorf("failed to fetch system treasury wallet: %w", err) + } + if treasury.Currency != wallet.Currency { + return fmt.Errorf("initial funding from system treasury (%s) to wallet (%s) not supported: %w", treasury.Currency, wallet.Currency, domain.ErrCurrencyMismatch) + } + if err := treasury.Debit(req.InitialBalance); err != nil { + return fmt.Errorf("failed to debit system treasury: %w", err)
+CreateWallet is wired to the public POST /wallets route, but this branch treats the caller's InitialBalance as a treasury-funded deposit. An unauthenticated caller can create a wallet and then use POST /transfers with the known system_treasury account, effectively minting or draining funds. Keep treasury funding behind an authorized/admin path or seed balances out of band; do not expose this workflow on the public router.
+```
+
+### AI Response / Outcome
+- Designed and documented comprehensive implementation plan in `implementation_plan.md`.
+- Isolated system treasury from public transfer operations:
+  - Restricted `system_treasury` in `TransferService.ExecuteTransfer` (`ErrSystemTreasuryRestricted`) returning HTTP 403 Forbidden.
+- Secured initial wallet funding on the public router:
+  - On public `POST /wallets`, `InitialBalance > 0` requires administrative authorization (`X-Admin-Key` / Bearer token), returning HTTP 403 Forbidden if unauthenticated.
+  - Added dedicated authorized route `POST /admin/wallets` requiring admin credentials (HTTP 401 Unauthorized when missing/invalid).
+  - Preserved out-of-band balance seeding for direct Go service calls (`ContextWithPublicCaller` guard).
+  - Added `AdminKey` configuration setting required in production and staging environments.
+
+---
+
+## Turn 63 — 2026-09-12T08:33:43Z
+
+### User Request
+```text
+In [migrations/migrations.go](https://github.com/Robustrade/wallet-transfer-assignment/pull/169#discussion_r3995500999):
+> + defer lockConn.Release() + + const migrationAdvisoryLockID = 888999 + if _, err := lockConn.Exec(ctx, "SELECT pg_advisory_lock($1);", migrationAdvisoryLockID); err != nil { + return fmt.Errorf("failed to acquire migration advisory lock: %w", err) + } + defer func() { + _, _ = lockConn.Exec(context.Background(), "SELECT pg_advisory_unlock($1);", migrationAdvisoryLockID)
+If the advisory-lock call fails after PostgreSQL has actually acquired the session lock (for example, a lost response or canceled context), the unlock defer has not been registered yet. lockConn.Release() can then return a session holding 888999 to the pool, causing later migration attempts to block indefinitely. Register the unlock defer immediately after acquiring the connection, before attempting pg_advisory_lock, or use a transaction-scoped advisory lock.
+```
+
+**Tools Executed**: `view_file` (14), `replace_file_content` (10), `run_command` (7), `write_to_file` (2)
+
+### AI Response / Outcome
+
+Both code review issues have been completely implemented, verified with automated tests, and documented:
+
+1. **Migration Advisory Lock Defer Ordering ([`migrations/migrations.go`](file:///c:/Go/src/wallet-transfer-assignment/migrations/migrations.go#L28-L38))**:
+   - Moved the deferred `SELECT pg_advisory_unlock(888999)` execution immediately after connection acquisition, before invoking `lockConn.Exec(ctx, "SELECT pg_advisory_lock($1);", ...)`.
+   - Ensures that if PostgreSQL acquires the session lock but client-side execution encounters a context cancellation or network interruption, the deferred unlock runs with `context.Background()` before `lockConn.Release()` returns the connection to the pool.
+   - Verified via `TestMigrations_CanceledContextReleasesAdvisoryLock`: passes cleanly and confirms no advisory lock leaks to the pool.
+
+2. **System Treasury Protection in Transfers ([`internal/service/transfer_service.go`](file:///c:/Go/src/wallet-transfer-assignment/internal/service/transfer_service.go#L169-L173), [`internal/handler/transfer_handler.go`](file:///c:/Go/src/wallet-transfer-assignment/internal/handler/transfer_handler.go#L58-L61))**:
+   - In `ExecuteTransfer`, added explicit checks rejecting requests where `FromWalletID == domain.SystemTreasuryWalletID` or `ToWalletID == domain.SystemTreasuryWalletID` with `domain.ErrSystemTreasuryRestricted`.
+   - In `TransferHandler.CreateTransfer`, mapped `domain.ErrSystemTreasuryRestricted` to HTTP `403 Forbidden`.
+   - Verified via `TestTransferService_SystemTreasuryRestricted` and `TestHandler_Transfer_SystemTreasuryForbidden`.
+
+3. **Authorized Treasury Funding & Public Router Restrictions ([`internal/service/wallet_service.go`](file:///c:/Go/src/wallet-transfer-assignment/internal/service/wallet_service.go#L25-L42), [`internal/handler/wallet_handler.go`](file:///c:/Go/src/wallet-transfer-assignment/internal/handler/wallet_handler.go#L20-L80), [`internal/handler/router.go`](file:///c:/Go/src/wallet-transfer-assignment/internal/handler/router.go#L28-L33))**:
+   - On public router `POST /wallets`: unauthenticated requests with `initialBalance > 0` are rejected with HTTP `403 Forbidden` (`domain.ErrUnauthorizedFunding`). Unauthenticated zero-balance wallet creation is permitted.
+   - Registered `POST /admin/wallets` requiring admin credentials (`X-Admin-Key` or `Authorization: Bearer <ADMIN_KEY>`), returning HTTP `401 Unauthorized` if invalid or missing.
+   - In `WalletService.CreateWallet`: rejects creating wallets with ID `domain.SystemTreasuryWalletID` (`domain.ErrWalletAlreadyExists`). Direct service calls continue to support out-of-band balance seeding, while requests bearing `ContextWithPublicCaller` reject positive initial balances.
+   - Added `AdminKey` configuration in `internal/config/config.go`, strictly required in non-development environments and defaulting to `"admin-secret-dev"` in development/test.
+   - Verified via `TestHandler_CreateWallet_UnauthenticatedFundingForbidden`, `TestHandler_CreateWallet_ZeroBalanceAllowedForPublic`, `TestHandler_AdminCreateWallet_Success`, `TestHandler_AdminCreateWallet_Unauthorized`, and `TestWalletService_CreateWallet_PublicContextRestricted`.
+
+4. **All Tests Passing**:
+   - `go test -count=1 ./...`: all packages pass.
+   - `go vet ./...`: 0 warnings.
+
+---
+
+## Turn 64 — 2026-09-12T08:38:00Z
+
+### User Request
+```text
+In [migrations/000001_init_schema.sql](https://github.com/Robustrade/wallet-transfer-assignment/pull/169#discussion_r3995501007):
+> +CREATE CONSTRAINT TRIGGER trg_check_ledger_pair +AFTER INSERT OR UPDATE ON ledger_entries +DEFERRABLE INITIALLY DEFERRED +FOR EACH ROW +EXECUTE FUNCTION check_ledger_pair_integrity();
+These deferred triggers and the immutability trigger are the database's last line of defense for the ledger, but the integration tests only validate pair shape in CreateLedgerEntries before SQL executes and exercise valid application transfers. They do not attempt an invalid wallet/type pair or an UPDATE/DELETE against PostgreSQL, so a broken trigger definition could pass the suite while allowing unbalanced or mutable ledger data. Add integration assertions that malformed pairs fail at commit and ledger mutations are rejected.
+```
+
+**Tools Executed**: `view_file` (12), `replace_file_content` (8), `run_command` (8)
+
+### AI Response / Outcome
+
+Added comprehensive integration assertions directly exercising the database constraint triggers, unique indexes, and immutability triggers against PostgreSQL in [`internal/service/transfer_service_test.go`](file:///c:/Go/src/wallet-transfer-assignment/internal/service/transfer_service_test.go):
+
+1. **Ledger Immutability Trigger (`TestDatabaseTriggers_RejectLedgerMutation_UpdateAndDelete`)**:
+   - Executes a valid transfer to create committed ledger entries.
+   - Issues a direct raw SQL `UPDATE` against `ledger_entries` using `pgxpool.Pool.Exec`: fails with `trg_prevent_ledger_mutation` error containing `"ledger entries are immutable: deletions and updates are forbidden"`.
+   - Issues a direct raw SQL `DELETE` against `ledger_entries`: fails with `trg_prevent_ledger_mutation` error containing `"ledger entries are immutable: deletions and updates are forbidden"`.
+   - Asserts that both ledger rows remain completely intact and unmodified in the database.
+
+2. **Duplicate Entry Type Rejection (`TestDatabaseConstraints_RejectDuplicateLedgerEntryType`)**:
+   - Inserts a valid `DEBIT` entry for a transfer.
+   - Immediately attempts to insert a second `DEBIT` entry for the same transfer: fails immediately on insert due to composite unique index `idx_ledger_entries_transfer_type` (`duplicate key value violates unique constraint`).
+
+3. **Malformed Ledger Pair Commit-Time Failure (`TestDatabaseTriggers_MalformedLedgerPairFailsAtCommit`)**:
+   - Tests 6 distinct malformed scenarios inside dedicated transactions:
+     - *Single debit entry without matching credit*: fails at `tx.Commit()` with `"invalid ledger pair for transfer"`.
+     - *Single credit entry without matching debit*: fails at `tx.Commit()` with `"invalid ledger pair for transfer"`.
+     - *Mismatched destination wallet on credit entry*: fails at `tx.Commit()` with `"invalid ledger pair for transfer"`.
+     - *Mismatched source wallet on debit entry*: fails at `tx.Commit()` with `"invalid ledger pair for transfer"`.
+     - *Credit entry amount differs from transfer amount*: fails at `tx.Commit()` with `"invalid ledger pair for transfer"`.
+     - *Debit entry amount differs from transfer amount*: fails at `tx.Commit()` with `"invalid ledger pair for transfer"`.
+
+4. **Transfer Status Constraint Trigger (`TestDatabaseTriggers_ProcessedTransferWithoutLedgerPairFailsAtCommit`)**:
+   - In a transaction, creates a transfer with `status = 'PROCESSED'` and attempts to commit without any ledger entries.
+   - Fails at `tx.Commit()` under deferred constraint trigger `trg_check_transfer_processed` with `"cannot commit PROCESSED transfer ... requires exactly 1 DEBIT on from_wallet ... and 1 CREDIT on to_wallet ... matching transfer amount"`.
+
+5. **Test Suite Verification**:
+   - `go test -v -count=1 -run "TestDatabase" ./internal/service/...`: all passed.
+   - `go test -count=1 ./...`: 100% passed.
+   - `go vet ./...`: 0 warnings.
+
+---
+
+## Turn 65 — 2026-09-12T08:44:00Z
+
+### User Request
+```text
+In [internal/domain/errors.go](https://github.com/Robustrade/wallet-transfer-assignment/pull/169#discussion_r3995501022):
+> + ErrNegativeBalance = errors.New("initial balance cannot be negative") + + // ErrBalanceOverflow is returned when crediting an amount would overflow the maximum wallet balance. + ErrBalanceOverflow = errors.New("balance overflow: maximum wallet balance exceeded") + + // ErrCurrencyMismatch is returned when source and destination wallets have different currencies. + ErrCurrencyMismatch = errors.New("source and destination wallets have different currencies") + + // ErrTransferNotFound is returned when a requested transfer does not exist. + ErrTransferNotFound = errors.New("transfer not found") + + // ErrWalletAlreadyExists is returned when attempting to create a wallet with an existing ID. + ErrWalletAlreadyExists = errors.New("wallet already exists") + + // ErrInvalidIdempotencyKey is returned when the idempotency key is invalid or exceeds maximum length. + ErrInvalidIdempotencyKey = errors.New("idempotency key must not be empty and must not exceed 128 characters")
+ErrInvalidIdempotencyKey is described as covering empty and overlong keys, but ExecuteTransfer returns ErrMissingIdempotencyKey for an empty key. This makes the error text misleading wherever the length-specific error is surfaced; make this message describe only the overlong-key condition or align the service behavior.
+```
+
+**Tools Executed**: `grep_search` (4), `view_file` (7), `replace_file_content` (3), `run_command` (4)
+
+### AI Response / Outcome
+
+Aligned the error description, error string, and domain validation with service behavior:
+
+1. **Focused Error Definition (`internal/domain/errors.go`)**:
+   - Updated `ErrInvalidIdempotencyKey` description and message to describe only the overlong-key condition:
+     ```go
+     // ErrInvalidIdempotencyKey is returned when the idempotency key exceeds maximum length.
+     ErrInvalidIdempotencyKey = errors.New("idempotency key must not exceed 128 characters")
+     ```
+   - Separates empty keys (`ErrMissingIdempotencyKey`: `"idempotency key is required"`) from overlong keys (`ErrInvalidIdempotencyKey`: `"idempotency key must not exceed 128 characters"`).
+
+2. **Domain Model Validation Alignment (`internal/domain/transfer.go`)**:
+   - Added length validation `len(t.IdempotencyKey) > 128` returning `ErrInvalidIdempotencyKey` to `Transfer.Validate()`, keeping domain entity validation completely consistent with `ExecuteTransfer`.
+
+3. **Unit Test Verification (`internal/domain/domain_test.go`)**:
+   - Added unit test asserting `Transfer.Validate()` returns `ErrInvalidIdempotencyKey` for keys longer than 128 characters.
+   - All tests across all packages pass (`go test -count=1 ./...`).
+   - `go vet ./...` reports 0 warnings.
+
 

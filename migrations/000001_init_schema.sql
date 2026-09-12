@@ -150,5 +150,16 @@ BEFORE DELETE OR UPDATE ON ledger_entries
 FOR EACH ROW
 EXECUTE FUNCTION prevent_ledger_mutation();
 
-
-
+-- Ensure least-privileged application role exists and has appropriate table permissions
+DO $$
+BEGIN
+    BEGIN
+        IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'wallet_app') THEN
+            CREATE ROLE wallet_app WITH LOGIN PASSWORD 'wallet_app_password';
+        END IF;
+        GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO wallet_app;
+        GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO wallet_app;
+    EXCEPTION WHEN insufficient_privilege THEN
+        NULL;
+    END;
+END $$;

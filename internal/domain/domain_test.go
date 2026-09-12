@@ -2,6 +2,7 @@ package domain_test
 
 import (
 	"math"
+	"strings"
 	"testing"
 
 	"wallet-transfer-assignment/internal/domain"
@@ -127,6 +128,12 @@ func TestTransfer_ValidationErrors(t *testing.T) {
 	tr.IdempotencyKey = ""
 	if err := tr.Validate(); err != domain.ErrMissingIdempotencyKey {
 		t.Fatalf("expected ErrMissingIdempotencyKey, got %v", err)
+	}
+
+	// Overlong idempotency key (> 128 chars)
+	tr.IdempotencyKey = strings.Repeat("a", 129)
+	if err := tr.Validate(); err != domain.ErrInvalidIdempotencyKey {
+		t.Fatalf("expected ErrInvalidIdempotencyKey, got %v", err)
 	}
 
 	// Missing from_wallet_id

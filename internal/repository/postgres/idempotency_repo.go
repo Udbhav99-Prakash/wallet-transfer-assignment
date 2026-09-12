@@ -59,22 +59,26 @@ func (r *idempotencyRepository) ReserveIdempotency(ctx context.Context, record *
 		}
 
 		// Explicit stale-owner recovery with owner token fencing:
-		// If existing record is IN_PROGRESS and hasn't been updated for longer than staleTimeout,
+		// If existing record is IN_PROGRESS, matches our request hash, and hasn't been updated for longer than staleTimeout,
 		// the previous owner likely crashed or timed out. Attempt to reclaim it atomically.
-		if staleTimeout > 0 && existing.Status == domain.IdempotencyStatusInProgress && now.Sub(existing.UpdatedAt) > staleTimeout {
+		// If the request hash differs, the key is already bound to a different payload and must NOT be overwritten.
+		if staleTimeout > 0 &&
+			existing.Status == domain.IdempotencyStatusInProgress &&
+			existing.RequestHash == record.RequestHash &&
+			now.Sub(existing.UpdatedAt) > staleTimeout {
 			reclaimQuery := `
 				UPDATE idempotency_records
-				SET request_hash = $1, owner_token = $2, status = $3, updated_at = $4
-				WHERE idempotency_key = $5 AND status = 'IN_PROGRESS' AND updated_at <= $6
+				SET owner_token = $1, status = $2, updated_at = $3
+				WHERE idempotency_key = $4 AND request_hash = $5 AND status = 'IN_PROGRESS' AND updated_at <= $6
 				RETURNING idempotency_key
 			`
 			var reclaimedKey string
 			reclaimErr := r.db.QueryRow(ctx, reclaimQuery,
-				record.RequestHash,
 				record.OwnerToken,
 				string(domain.IdempotencyStatusInProgress),
 				now,
 				record.IdempotencyKey,
+				record.RequestHash,
 				existing.UpdatedAt,
 			).Scan(&reclaimedKey)
 
@@ -86,7 +90,7 @@ func (r *idempotencyRepository) ReserveIdempotency(ctx context.Context, record *
 			}
 
 			if errors.Is(reclaimErr, pgx.ErrNoRows) {
-				// Another worker reclaimed or completed it concurrently; fetch latest state
+				// Another worker reclaimed or completed it concurrently, or request hash changed; fetch latest state
 				refetched, refetchErr := r.GetIdempotency(ctx, record.IdempotencyKey)
 				if refetchErr != nil {
 					return nil, false, fmt.Errorf("failed to refetch idempotency record after reclaim conflict: %w", refetchErr)

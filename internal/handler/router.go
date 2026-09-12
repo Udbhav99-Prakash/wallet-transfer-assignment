@@ -27,6 +27,7 @@ func NewRouter(cfg Config) http.Handler {
 
 	// Wallets
 	mux.HandleFunc("POST /wallets", cfg.WalletHandler.CreateWallet)
+	mux.HandleFunc("POST /admin/wallets", cfg.WalletHandler.CreateAdminWallet)
 	mux.HandleFunc("GET /wallets/{wallet_id}", cfg.WalletHandler.GetWallet)
 	mux.HandleFunc("GET /wallets/{wallet_id}/ledger", cfg.WalletHandler.GetWalletLedger)
 	mux.HandleFunc("GET /wallets/{wallet_id}/reconcile", cfg.WalletHandler.ReconcileWallet)

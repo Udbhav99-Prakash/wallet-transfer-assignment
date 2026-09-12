@@ -22,6 +22,19 @@ func NewWalletService(txManager repository.TxManager, repos repository.Repositor
 	return &WalletService{txManager: txManager, repos: repos}
 }
 
+type publicCallerKey struct{}
+
+// ContextWithPublicCaller returns a new context marking the request as coming from an unauthenticated public caller.
+func ContextWithPublicCaller(ctx context.Context) context.Context {
+	return context.WithValue(ctx, publicCallerKey{}, true)
+}
+
+// IsPublicCaller returns true if the context represents an unauthenticated public caller.
+func IsPublicCaller(ctx context.Context) bool {
+	v, ok := ctx.Value(publicCallerKey{}).(bool)
+	return ok && v
+}
+
 // CreateWallet creates a new wallet with an initial balance and initial credit ledger record if balance > 0.
 func (s *WalletService) CreateWallet(ctx context.Context, req CreateWalletRequest) (*domain.Wallet, error) {
 	if req.Name == "" {
@@ -30,10 +43,16 @@ func (s *WalletService) CreateWallet(ctx context.Context, req CreateWalletReques
 	if req.InitialBalance < 0 {
 		return nil, domain.ErrNegativeBalance
 	}
+	if req.InitialBalance > 0 && IsPublicCaller(ctx) {
+		return nil, domain.ErrUnauthorizedFunding
+	}
 
 	walletID := req.ID
 	if walletID == "" {
 		walletID = uuid.NewString()
+	}
+	if walletID == domain.SystemTreasuryWalletID {
+		return nil, domain.ErrWalletAlreadyExists
 	}
 
 	currency := req.Currency

@@ -41,6 +41,9 @@ func (t *Transfer) Validate() error {
 	if t.IdempotencyKey == "" {
 		return ErrMissingIdempotencyKey
 	}
+	if len(t.IdempotencyKey) > 128 {
+		return ErrInvalidIdempotencyKey
+	}
 	if t.FromWalletID == "" || t.ToWalletID == "" {
 		return ErrMissingWalletID
 	}

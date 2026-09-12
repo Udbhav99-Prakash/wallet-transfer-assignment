@@ -86,7 +86,43 @@ func (s *TransferService) ExecuteTransfer(ctx context.Context, req CreateTransfe
 			if time.Since(existing.UpdatedAt) <= staleTimeout {
 				return nil, domain.ErrIdempotencyInProgress
 			}
-			// If stale, fall through to business validation and atomic reclaim in ReserveIdempotency.
+			// If stale, check if an underlying transfer was already committed for this idempotency key.
+			// If a previous execution committed the transfer but crashed or failed to finalize idempotency_records,
+			// recover and return the committed result rather than executing a duplicate transfer!
+			existingTx, tErr := s.repos.Transfers.GetTransferByIdempotencyKey(ctx, req.IdempotencyKey)
+			if tErr == nil && existingTx != nil {
+				respCode := http.StatusCreated
+				status := domain.IdempotencyStatusCompleted
+				var failureReason *string
+				if existingTx.Status == domain.TransferStatusFailed {
+					respCode = http.StatusUnprocessableEntity
+					status = domain.IdempotencyStatusFailed
+					failureReason = existingTx.FailureReason
+				}
+				resp := &TransferResponse{
+					TransferID:     existingTx.ID,
+					IdempotencyKey: existingTx.IdempotencyKey,
+					FromWalletID:   existingTx.FromWalletID,
+					ToWalletID:     existingTx.ToWalletID,
+					Amount:         existingTx.Amount,
+					Status:         existingTx.Status,
+					FailureReason:  failureReason,
+					CreatedAt:      existingTx.CreatedAt,
+					IsReplay:       true,
+					ResponseCode:   respCode,
+				}
+				respBytes, _ := json.Marshal(resp)
+				existing.Status = status
+				existing.TransferID = &existingTx.ID
+				existing.ResponseCode = respCode
+				existing.ResponseBody = string(respBytes)
+				_ = s.repos.Idempotency.UpdateIdempotency(ctx, existing)
+				if status == domain.IdempotencyStatusFailed {
+					return resp, s.mapFailureReasonToError(failureReason, respCode)
+				}
+				return resp, nil
+			}
+			// If stale and no transfer was committed, fall through to business validation and atomic reclaim in ReserveIdempotency.
 		}
 	}
 
@@ -96,6 +132,10 @@ func (s *TransferService) ExecuteTransfer(ctx context.Context, req CreateTransfe
 	// with the exact same precedence as sequential reuses.
 	cleanupStaleReservation := func() {
 		if existing != nil && existing.Status == domain.IdempotencyStatusInProgress {
+			// Do not delete reservation if a transfer was already committed!
+			if existingTx, tErr := s.repos.Transfers.GetTransferByIdempotencyKey(ctx, req.IdempotencyKey); tErr == nil && existingTx != nil {
+				return
+			}
 			cleanupCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 			defer cancel()
 			_ = s.repos.Idempotency.DeleteInProgress(cleanupCtx, req.IdempotencyKey, existing.OwnerToken)
@@ -127,6 +167,9 @@ func (s *TransferService) ExecuteTransfer(ctx context.Context, req CreateTransfe
 	// 3. Business-field validation (for new keys or stale lock reclaims)
 	if req.FromWalletID == "" || req.ToWalletID == "" {
 		return nil, checkValidationErr(domain.ErrMissingWalletID)
+	}
+	if req.FromWalletID == domain.SystemTreasuryWalletID || req.ToWalletID == domain.SystemTreasuryWalletID {
+		return nil, checkValidationErr(domain.ErrSystemTreasuryRestricted)
 	}
 	if req.FromWalletID == req.ToWalletID {
 		return nil, checkValidationErr(domain.ErrSameWalletTransfer)
@@ -512,20 +555,41 @@ func (s *TransferService) ExecuteTransfer(ctx context.Context, req CreateTransfe
 				}
 			} else if rec.Status == domain.IdempotencyStatusInProgress {
 				transfer, tErr := s.repos.Transfers.GetTransferByID(reconcileCtx, transferID)
-				if tErr == nil && transfer != nil && transfer.Status == domain.TransferStatusProcessed {
-					rec.Status = domain.IdempotencyStatusCompleted
-					rec.TransferID = &transfer.ID
-					rec.ResponseCode = http.StatusCreated
-					rec.ResponseBody = string(respBytes)
-					rec.OwnerToken = ownerToken
-					_ = s.repos.Idempotency.UpdateIdempotency(reconcileCtx, rec)
-					success = true
-					return finalResponse, nil
-				} else if errors.Is(tErr, domain.ErrWalletNotFound) || errors.Is(tErr, pgx.ErrNoRows) || transfer == nil {
+				if tErr == nil && transfer != nil {
+					if transfer.Status == domain.TransferStatusProcessed {
+						rec.Status = domain.IdempotencyStatusCompleted
+						rec.TransferID = &transfer.ID
+						rec.ResponseCode = http.StatusCreated
+						rec.ResponseBody = string(respBytes)
+						rec.OwnerToken = ownerToken
+						if updateErr := s.repos.Idempotency.UpdateIdempotency(reconcileCtx, rec); updateErr != nil {
+							if errors.Is(updateErr, domain.ErrIdempotencyLeaseLost) {
+								return nil, domain.ErrIdempotencyLeaseLost
+							}
+							return nil, fmt.Errorf("failed to finalize idempotency record: %w", updateErr)
+						}
+						success = true
+						return finalResponse, nil
+					} else if transfer.Status == domain.TransferStatusFailed {
+						rec.Status = domain.IdempotencyStatusFailed
+						rec.TransferID = &transfer.ID
+						rec.ResponseCode = http.StatusUnprocessableEntity
+						rec.ResponseBody = string(respBytes)
+						rec.OwnerToken = ownerToken
+						if updateErr := s.repos.Idempotency.UpdateIdempotency(reconcileCtx, rec); updateErr != nil {
+							if errors.Is(updateErr, domain.ErrIdempotencyLeaseLost) {
+								return nil, domain.ErrIdempotencyLeaseLost
+							}
+							return nil, fmt.Errorf("failed to finalize idempotency record: %w", updateErr)
+						}
+						success = true
+						return finalResponse, domain.ErrInsufficientFunds
+					}
+				} else if errors.Is(tErr, domain.ErrTransferNotFound) || errors.Is(tErr, pgx.ErrNoRows) {
 					// Confirmed rolled back: safe to delete in-progress reservation
 					_ = s.repos.Idempotency.DeleteInProgress(reconcileCtx, req.IdempotencyKey, ownerToken)
 				}
-				// If status is still ambiguous (e.g. DB error), keep the reservation intact!
+				// If status is still ambiguous (e.g. operational DB error or timeout), keep the reservation intact!
 			}
 		}
 	}

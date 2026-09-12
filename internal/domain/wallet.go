@@ -5,6 +5,9 @@ import (
 	"time"
 )
 
+// SystemTreasuryWalletID is the reserved identifier for the system treasury account.
+const SystemTreasuryWalletID = "system_treasury"
+
 // Wallet represents an individual account holding funds.
 type Wallet struct {
 	ID        string    `json:"id"`

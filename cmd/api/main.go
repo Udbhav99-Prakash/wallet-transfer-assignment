@@ -20,7 +20,10 @@ import (
 )
 
 func main() {
-	cfg := config.Load()
+	cfg, err := config.Load()
+	if err != nil {
+		log.Fatalf("Configuration error: %v", err)
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -58,7 +61,7 @@ func main() {
 
 	// Construct handlers
 	transferHandler := handler.NewTransferHandler(transferService)
-	walletHandler := handler.NewWalletHandler(walletService)
+	walletHandler := handler.NewWalletHandler(walletService, cfg.AdminKey)
 
 	// Construct router
 	router := handler.NewRouter(handler.Config{

@@ -55,6 +55,10 @@ func (h *TransferHandler) CreateTransfer(w http.ResponseWriter, r *http.Request)
 			WriteError(w, http.StatusNotFound, err.Error())
 			return
 
+		case errors.Is(err, domain.ErrSystemTreasuryRestricted):
+			WriteError(w, http.StatusForbidden, err.Error())
+			return
+
 		case errors.Is(err, domain.ErrSameWalletTransfer),
 			errors.Is(err, domain.ErrInvalidAmount),
 			errors.Is(err, domain.ErrMissingIdempotencyKey),

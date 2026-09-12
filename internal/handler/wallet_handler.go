@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log"
 	"net/http"
+	"strings"
 
 	"wallet-transfer-assignment/internal/domain"
 	"wallet-transfer-assignment/internal/service"
@@ -12,14 +13,89 @@ import (
 
 type WalletHandler struct {
 	walletService *service.WalletService
+	adminKey      string
 }
 
-func NewWalletHandler(walletService *service.WalletService) *WalletHandler {
-	return &WalletHandler{walletService: walletService}
+func NewWalletHandler(walletService *service.WalletService, adminKey string) *WalletHandler {
+	return &WalletHandler{
+		walletService: walletService,
+		adminKey:      adminKey,
+	}
+}
+
+func (h *WalletHandler) isAuthorizedAdmin(r *http.Request) bool {
+	if h.adminKey == "" {
+		return false
+	}
+	if r.Header.Get("X-Admin-Key") == h.adminKey {
+		return true
+	}
+	auth := r.Header.Get("Authorization")
+	if strings.HasPrefix(auth, "Bearer ") && strings.TrimPrefix(auth, "Bearer ") == h.adminKey {
+		return true
+	}
+	return false
 }
 
 // CreateWallet handles POST /wallets
 func (h *WalletHandler) CreateWallet(w http.ResponseWriter, r *http.Request) {
+	var req service.CreateWalletRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		WriteError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		return
+	}
+
+	// Initial funding from treasury is strictly restricted on the public router.
+	// Unauthenticated callers cannot seed positive initial balances.
+	if req.InitialBalance > 0 && !h.isAuthorizedAdmin(r) {
+		WriteError(w, http.StatusForbidden, domain.ErrUnauthorizedFunding.Error())
+		return
+	}
+
+	ctx := r.Context()
+	if !h.isAuthorizedAdmin(r) {
+		ctx = service.ContextWithPublicCaller(ctx)
+	}
+
+	wallet, err := h.walletService.CreateWallet(ctx, req)
+	if err != nil {
+		switch {
+		case errors.Is(err, domain.ErrWalletNameRequired),
+			errors.Is(err, domain.ErrNegativeBalance),
+			errors.Is(err, domain.ErrCurrencyMismatch),
+			errors.Is(err, domain.ErrBalanceOverflow):
+			WriteError(w, http.StatusBadRequest, err.Error())
+			return
+
+		case errors.Is(err, domain.ErrUnauthorizedFunding):
+			WriteError(w, http.StatusForbidden, err.Error())
+			return
+
+		case errors.Is(err, domain.ErrInsufficientFunds):
+			WriteError(w, http.StatusUnprocessableEntity, err.Error())
+			return
+
+		case errors.Is(err, domain.ErrWalletAlreadyExists):
+			WriteError(w, http.StatusConflict, err.Error())
+			return
+
+		default:
+			log.Printf("[ERROR] failed to create wallet: %v", err)
+			WriteError(w, http.StatusInternalServerError, "internal server error")
+			return
+		}
+	}
+
+	WriteJSON(w, http.StatusCreated, wallet)
+}
+
+// CreateAdminWallet handles POST /admin/wallets
+func (h *WalletHandler) CreateAdminWallet(w http.ResponseWriter, r *http.Request) {
+	if !h.isAuthorizedAdmin(r) {
+		WriteError(w, http.StatusUnauthorized, "unauthorized: missing or invalid admin key")
+		return
+	}
+
 	var req service.CreateWalletRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		WriteError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
@@ -45,7 +121,7 @@ func (h *WalletHandler) CreateWallet(w http.ResponseWriter, r *http.Request) {
 			return
 
 		default:
-			log.Printf("[ERROR] failed to create wallet: %v", err)
+			log.Printf("[ERROR] failed to create admin wallet: %v", err)
 			WriteError(w, http.StatusInternalServerError, "internal server error")
 			return
 		}

@@ -28,12 +28,17 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 	defer lockConn.Release()
 
 	const migrationAdvisoryLockID = 888999
-	if _, err := lockConn.Exec(ctx, "SELECT pg_advisory_lock($1);", migrationAdvisoryLockID); err != nil {
-		return fmt.Errorf("failed to acquire migration advisory lock: %w", err)
-	}
+	// Register the unlock defer immediately after acquiring the connection, before attempting pg_advisory_lock.
+	// If pg_advisory_lock fails after PostgreSQL acquires the session lock (e.g. context cancellation or
+	// network timeout), this defer ensures the lock is freed with context.Background() before lockConn.Release()
+	// returns the connection to the pool.
 	defer func() {
 		_, _ = lockConn.Exec(context.Background(), "SELECT pg_advisory_unlock($1);", migrationAdvisoryLockID)
 	}()
+
+	if _, err := lockConn.Exec(ctx, "SELECT pg_advisory_lock($1);", migrationAdvisoryLockID); err != nil {
+		return fmt.Errorf("failed to acquire migration advisory lock: %w", err)
+	}
 
 	// Create schema_migrations table if not exists to track applied versions
 	createTableQuery := `

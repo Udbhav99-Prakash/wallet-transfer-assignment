@@ -19,6 +19,8 @@ import (
 	"wallet-transfer-assignment/pkg/testutil"
 )
 
+const testAdminKey = "test-admin-key"
+
 func setupTestServerWithRepos(t *testing.T) (http.Handler, repository.Repositories) {
 	t.Helper()
 	pool := testutil.SetupTestDB(t)
@@ -35,7 +37,7 @@ func setupTestServerWithRepos(t *testing.T) (http.Handler, repository.Repositori
 	walletService := service.NewWalletService(txManager, repos)
 
 	transferHandler := handler.NewTransferHandler(transferService)
-	walletHandler := handler.NewWalletHandler(walletService)
+	walletHandler := handler.NewWalletHandler(walletService, testAdminKey)
 
 	return handler.NewRouter(handler.Config{
 		TransferHandler: transferHandler,
@@ -72,6 +74,7 @@ func TestHandler_TransferWorkflow(t *testing.T) {
 	})
 	w1Req := httptest.NewRequest(http.MethodPost, "/wallets", bytes.NewReader(w1ReqBody))
 	w1Req.Header.Set("Content-Type", "application/json")
+	w1Req.Header.Set("X-Admin-Key", testAdminKey)
 	w1Recorder := httptest.NewRecorder()
 	router.ServeHTTP(w1Recorder, w1Req)
 
@@ -87,6 +90,7 @@ func TestHandler_TransferWorkflow(t *testing.T) {
 	})
 	w2Req := httptest.NewRequest(http.MethodPost, "/wallets", bytes.NewReader(w2ReqBody))
 	w2Req.Header.Set("Content-Type", "application/json")
+	w2Req.Header.Set("X-Admin-Key", testAdminKey)
 	w2Recorder := httptest.NewRecorder()
 	router.ServeHTTP(w2Recorder, w2Req)
 
@@ -560,7 +564,7 @@ func TestHandler_CreateWallet_Conflict(t *testing.T) {
 func TestHandler_CreateWallet_InsufficientTreasuryFunds(t *testing.T) {
 	router := setupTestServer(t)
 
-	// Treasury balance is 100_000_000_000_000; requesting more must return 422 Unprocessable Entity
+	// Treasury balance is 100_000_000_000_000; requesting more with admin authorization must return 422 Unprocessable Entity
 	body, _ := json.Marshal(service.CreateWalletRequest{
 		ID:             "wallet_excessive_funds",
 		Name:           "Billionaire Wallet",
@@ -568,11 +572,133 @@ func TestHandler_CreateWallet_InsufficientTreasuryFunds(t *testing.T) {
 	})
 	req := httptest.NewRequest(http.MethodPost, "/wallets", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Admin-Key", testAdminKey)
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
 
 	if w.Code != http.StatusUnprocessableEntity {
 		t.Fatalf("expected 422 Unprocessable Entity for initial balance exceeding treasury, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestHandler_CreateWallet_UnauthenticatedFundingForbidden(t *testing.T) {
+	router := setupTestServer(t)
+
+	// Unauthenticated caller attempts to mint positive balance on public POST /wallets
+	body, _ := json.Marshal(service.CreateWalletRequest{
+		ID:             "unauth_wallet_funding",
+		Name:           "Hacker Wallet",
+		InitialBalance: 1000,
+	})
+	req := httptest.NewRequest(http.MethodPost, "/wallets", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden for unauthenticated initial balance funding, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var errResp handler.ErrorResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &errResp); err != nil {
+		t.Fatalf("failed to decode error response: %v", err)
+	}
+	if errResp.Error != domain.ErrUnauthorizedFunding.Error() {
+		t.Fatalf("expected error message %q, got %q", domain.ErrUnauthorizedFunding.Error(), errResp.Error)
+	}
+}
+
+func TestHandler_CreateWallet_ZeroBalanceAllowedForPublic(t *testing.T) {
+	router := setupTestServer(t)
+
+	// Unauthenticated caller creates zero-balance wallet on public POST /wallets
+	body, _ := json.Marshal(service.CreateWalletRequest{
+		ID:             "public_zero_balance_wallet",
+		Name:           "Standard User Wallet",
+		InitialBalance: 0,
+	})
+	req := httptest.NewRequest(http.MethodPost, "/wallets", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected 201 Created for public zero balance wallet creation, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestHandler_AdminCreateWallet_Success(t *testing.T) {
+	router := setupTestServer(t)
+
+	// Authorized caller calls POST /admin/wallets with X-Admin-Key
+	body, _ := json.Marshal(service.CreateWalletRequest{
+		ID:             "admin_seeded_wallet",
+		Name:           "VIP Seeded Wallet",
+		InitialBalance: 500,
+	})
+	req := httptest.NewRequest(http.MethodPost, "/admin/wallets", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Admin-Key", testAdminKey)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected 201 Created on POST /admin/wallets with valid key, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestHandler_AdminCreateWallet_Unauthorized(t *testing.T) {
+	router := setupTestServer(t)
+
+	// Caller calls POST /admin/wallets without admin credentials
+	body, _ := json.Marshal(service.CreateWalletRequest{
+		ID:             "unauthorized_admin_call",
+		Name:           "Sneaky Wallet",
+		InitialBalance: 500,
+	})
+	req := httptest.NewRequest(http.MethodPost, "/admin/wallets", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 Unauthorized on POST /admin/wallets without admin key, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestHandler_Transfer_SystemTreasuryForbidden(t *testing.T) {
+	router := setupTestServer(t)
+
+	// 1. Attempt transfer FROM system_treasury
+	bodyFrom, _ := json.Marshal(service.CreateTransferRequest{
+		IdempotencyKey: "drain_treasury_attempt",
+		FromWalletID:   "system_treasury",
+		ToWalletID:     "some_user_wallet",
+		Amount:         1000,
+	})
+	reqFrom := httptest.NewRequest(http.MethodPost, "/transfers", bytes.NewReader(bodyFrom))
+	reqFrom.Header.Set("Content-Type", "application/json")
+	wFrom := httptest.NewRecorder()
+	router.ServeHTTP(wFrom, reqFrom)
+
+	if wFrom.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden for transfer from system_treasury, got %d: %s", wFrom.Code, wFrom.Body.String())
+	}
+
+	// 2. Attempt transfer TO system_treasury
+	bodyTo, _ := json.Marshal(service.CreateTransferRequest{
+		IdempotencyKey: "deposit_to_treasury_attempt",
+		FromWalletID:   "some_user_wallet",
+		ToWalletID:     "system_treasury",
+		Amount:         1000,
+	})
+	reqTo := httptest.NewRequest(http.MethodPost, "/transfers", bytes.NewReader(bodyTo))
+	reqTo.Header.Set("Content-Type", "application/json")
+	wTo := httptest.NewRecorder()
+	router.ServeHTTP(wTo, reqTo)
+
+	if wTo.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden for transfer to system_treasury, got %d: %s", wTo.Code, wTo.Body.String())
 	}
 }
 
