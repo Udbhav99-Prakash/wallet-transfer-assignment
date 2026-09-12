@@ -26,7 +26,7 @@ type TransferRepository interface {
 // LedgerRepository manages append-only double-entry ledger records.
 type LedgerRepository interface {
 	CreateLedgerEntries(ctx context.Context, entries ...domain.LedgerEntry) error
-	GetLedgerByWalletID(ctx context.Context, walletID string) ([]domain.LedgerEntry, error)
+	GetLedgerByWalletID(ctx context.Context, walletID string, limit, offset int) ([]domain.LedgerEntry, error)
 	GetLedgerByTransferID(ctx context.Context, transferID string) ([]domain.LedgerEntry, error)
 	CalculateLedgerBalance(ctx context.Context, walletID string) (int64, error)
 }

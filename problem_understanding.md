@@ -463,3 +463,132 @@ Following the Red-Green-Refactor (TDD) development discipline and comprehensive 
 | **Money Representation**| Integer minor units (`BIGINT`) | Completely eliminates IEEE-754 floating point inaccuracies. |
 | **Idempotency Strategy**| Dedicated idempotency table + payload hash | Durable across restarts, detects payload tampering/collisions, and preserves original response body. |
 | **Database Engine** | PostgreSQL (with `jackc/pgx/v5`) | Industry-standard transactional engine supporting true row-level locks (`SELECT FOR UPDATE`), strict constraints, and connection pooling. Docker Compose provided for 1-command startup. |
+
+---
+
+## 9. How to Run
+
+### 9.1 Prerequisites
+- **Go**: 1.22 or newer
+- **Docker & Docker Compose**: For local PostgreSQL cluster
+- **PostgreSQL Client (Optional)**: `psql` for database inspection
+
+### 9.2 Start Database Services
+Start the PostgreSQL container with persistent storage and initialized roles/databases:
+```bash
+docker-compose up -d
+```
+The compose file spins up PostgreSQL on port `5432` with credentials:
+- User: `postgres`
+- Password: `postgres`
+- Primary Database: `wallet_db`
+- Test Database: `wallet_test_db` (provisioned via `scripts/init-user.sql`)
+
+### 9.3 Configuration Environment Variables
+The application reads configuration from environment variables with production-safe defaults:
+| Variable | Description | Default | Required in Non-Dev |
+| :--- | :--- | :--- | :--- |
+| `DATABASE_URL` | PostgreSQL connection string | `postgres://postgres:postgres@localhost:5432/wallet_db?sslmode=disable` | No |
+| `PORT` | HTTP server listening port | `8080` | No |
+| `APP_ENV` | Application environment (`development`, `production`, etc.) | `production` (safe default) | No |
+| `ADMIN_KEY` | Bearer token for `/admin/*` endpoints | `admin-secret-dev` (only if `APP_ENV=development` & default URL) | Yes |
+
+### 9.4 Start the Application
+To run the server in development mode:
+```bash
+# Set development environment and run
+export APP_ENV=development
+go run ./cmd/api
+```
+*(On Windows PowerShell:)*
+```powershell
+$env:APP_ENV = "development"
+go run ./cmd/api
+```
+
+Database migrations in `migrations/` are automatically applied on server startup.
+
+### 9.5 Sample API Commands
+
+#### 1. Create a Treasury-Funded Wallet (Admin)
+```bash
+curl -X POST http://localhost:8080/admin/wallets \
+  -H "Authorization: Bearer admin-secret-dev" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "id": "alice_wallet",
+    "name": "Alice",
+    "initialBalance": 1000
+  }'
+```
+
+#### 2. Create a Standard Wallet (Public)
+```bash
+curl -X POST http://localhost:8080/wallets \
+  -H "Content-Type: application/json" \
+  -d '{
+    "id": "bob_wallet",
+    "name": "Bob",
+    "initialBalance": 0
+  }'
+```
+
+#### 3. Execute an Idempotent Transfer
+```bash
+curl -X POST http://localhost:8080/transfers \
+  -H "Content-Type: application/json" \
+  -d '{
+    "idempotencyKey": "txn-001-uuid",
+    "fromWalletId": "alice_wallet",
+    "toWalletId": "bob_wallet",
+    "amount": 250
+  }'
+```
+
+#### 4. Query Wallet Balance
+```bash
+curl http://localhost:8080/wallets/alice_wallet
+```
+
+#### 5. Inspect Double-Entry Ledger with Pagination
+```bash
+curl "http://localhost:8080/wallets/alice_wallet/ledger?limit=10&offset=0"
+```
+
+---
+
+## 10. How to Test
+
+### 10.1 Running the Full Test Suite
+The test suite executes against an isolated PostgreSQL test database (`wallet_test_db`). To run all tests across all packages:
+```bash
+# Set test database URL (optional if using local docker defaults)
+export TEST_DATABASE_URL="postgres://postgres:postgres@localhost:5432/wallet_test_db?sslmode=disable"
+
+# Execute all tests with cache disabled
+go test -v -count=1 ./...
+```
+*(On Windows PowerShell:)*
+```powershell
+$env:TEST_DATABASE_URL = "postgres://postgres:postgres@localhost:5432/wallet_test_db?sslmode=disable"
+go test -v -count=1 ./...
+```
+
+### 10.2 Running Static Analysis & Linters
+Verify static analysis and compile correctness:
+```bash
+go vet ./...
+```
+
+### 10.3 Running Concurrency & Stress Tests
+Run high-concurrency double-spend and deadlock tests specifically:
+```bash
+go test -v -count=1 -run "TestTransferService_Concurrent" ./internal/service/...
+```
+
+### 10.4 Running Database Trigger & Migration Integrity Tests
+Verify migration advisory locking, schema validation, and constraint triggers:
+```bash
+go test -v -count=1 ./migrations/...
+```
+

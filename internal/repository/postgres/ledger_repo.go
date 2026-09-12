@@ -112,14 +112,24 @@ func (r *ledgerRepository) CreateLedgerEntries(ctx context.Context, entries ...d
 	return nil
 }
 
-func (r *ledgerRepository) GetLedgerByWalletID(ctx context.Context, walletID string) ([]domain.LedgerEntry, error) {
+func (r *ledgerRepository) GetLedgerByWalletID(ctx context.Context, walletID string, limit, offset int) ([]domain.LedgerEntry, error) {
+	if limit <= 0 {
+		limit = 50
+	} else if limit > 100 {
+		limit = 100
+	}
+	if offset < 0 {
+		offset = 0
+	}
+
 	query := `
 		SELECT id, COALESCE(transfer_id, ''), wallet_id, type, amount, created_at
 		FROM ledger_entries
 		WHERE wallet_id = $1
 		ORDER BY created_at ASC, id ASC
+		LIMIT $2 OFFSET $3
 	`
-	rows, err := r.db.Query(ctx, query, walletID)
+	rows, err := r.db.Query(ctx, query, walletID, limit, offset)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query ledger entries by wallet: %w", err)
 	}

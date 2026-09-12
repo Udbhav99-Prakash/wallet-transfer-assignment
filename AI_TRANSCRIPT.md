@@ -3577,4 +3577,91 @@ Aligned the error description, error string, and domain validation with service 
    - All tests across all packages pass (`go test -count=1 ./...`).
    - `go vet ./...` reports 0 warnings.
 
+---
+
+## Turn 66 — 2026-09-12T09:15:00Z
+
+### User Request
+```text
+internal/domain/wallet.go:24
+CanDebit reports true for zero or negative amounts whenever the balance is non-negative, unlike CanCredit, even though Debit rejects those amounts. Any caller using this predicate for validation can therefore approve an invalid debit; make the predicate require a strictly positive amount as well.
+
+internal/repository/postgres/ledger_repo.go:120
+This endpoint materializes every ledger row for a wallet into one slice and response. Ledger history is unbounded, so a long-lived wallet can make a request consume large amounts of memory and exceed the server timeout; add cursor/limit pagination (and expose it through the service/handler) or enforce a bounded response.
+
+In [internal/config/config.go]:
+If APP_ENV/ENV is omitted, Load defaults to development; a deployment that supplies only DATABASE_URL therefore also receives the repository-known admin-secret-dev. That exposes POST /admin/wallets and treasury funding whenever the environment marker is forgotten. Treat a missing environment as non-development (or otherwise require ADMIN_KEY when using an explicit/remote database) instead of defaulting a usable admin credential.
+
+In [internal/repository/postgres/idempotency_repo.go]:
+The UPDATE idempotency_records branch executes without an owner_token predicate whenever rec.OwnerToken is empty. Any caller omitting OwnerToken can therefore overwrite or complete an in-progress reservation held by a different worker... Require OwnerToken on all updates or reject updates that lack a fencing token.
+
+In [internal/repository/postgres/transfer_repo.go]:
+UpdateTransferStatus updates the transfer status without asserting that the row is still PENDING. If a transfer has already been marked FAILED or PROCESSED (for example by a concurrent worker, retry, or timeout handler), this statement can overwrite the terminal state... Guard the UPDATE with WHERE id = $... AND status = 'PENDING' and return a state-conflict error if zero rows are updated.
+
+In [migrations/000001_init_schema.sql]:
+trg_check_ledger_pair only verifies that the referenced transfer row exists; it does not assert that the transfer's status is PROCESSED at commit time. A transaction that updates a transfer to FAILED while writing ledger entries (or fails to advance the transfer to PROCESSED) can therefore commit an unbalanced or invalid ledger state... Assert that the referenced transfer row is in PROCESSED status at commit time.
+
+In [migrations/000001_init_schema.sql]:
+The migration script creates roles wallet_app and wallet_test_user and grants DDL rights. Hardcoding role creation and table ownership in application migrations breaks environments where migrations are run by an existing DBA/deployment user or where roles are managed by Terraform/IAM... Separate role provisioning from schema definition.
+
+In [migrations/migrations_test.go]:
+TestMigrations_CanceledContextReleasesAdvisoryLock cancels the migration context before calling Migrate, so the function returns before ever contacting PostgreSQL or issuing pg_advisory_lock. The test does not exercise post-acquisition cancellation or prove that lockConn.Release() clears the advisory lock... Hold an intentional lock to block Migrate, cancel its context while waiting, and verify that a follow-up migration can acquire the lock.
+```
+
+**Tools Executed**: `view_file`, `replace_file_content`, `run_command`
+
+### AI Response / Outcome
+
+All code review comments have been methodically addressed and verified across the codebase:
+
+1. **Strict Positive Debit Predicate ([`internal/domain/wallet.go`](file:///c:/Go/src/wallet-transfer-assignment/internal/domain/wallet.go#L23-L27))**:
+   - Updated `CanDebit(amount int64) bool` to strictly require `amount > 0 && w.Balance >= amount`, aligning it with `CanCredit` and `Debit` validation.
+   - Added unit test coverage in `internal/domain/domain_test.go` verifying non-positive amounts return `false`.
+
+2. **Bounded Ledger Pagination ([`internal/repository/postgres/ledger_repo.go`](file:///c:/Go/src/wallet-transfer-assignment/internal/repository/postgres/ledger_repo.go#L120-L160), [`internal/service/wallet_service.go`](file:///c:/Go/src/wallet-transfer-assignment/internal/service/wallet_service.go#L160-L175), [`internal/handler/wallet_handler.go`](file:///c:/Go/src/wallet-transfer-assignment/internal/handler/wallet_handler.go#L100-L140))**:
+   - Implemented bounded `GetLedgerByWalletID(ctx, walletID, limit, offset)` enforcing default limit 50, maximum limit 100, and non-negative offsets.
+   - Exposed pagination query parameters (`?limit=...&offset=...`) through `WalletService` and `WalletHandler.GetWalletLedger`.
+   - Added integration test `TestHandler_GetWalletLedger_Pagination` verifying boundary clamping and deterministic offset slices.
+
+3. **Safe-by-Default Configuration ([`internal/config/config.go`](file:///c:/Go/src/wallet-transfer-assignment/internal/config/config.go#L35-L65))**:
+   - Missing `APP_ENV`/`ENV` now defaults to `"production"` (safe by default).
+   - In non-development environments, `DATABASE_URL` and `ADMIN_KEY` are mandatory and return explicit configuration errors if omitted.
+   - In development environments, if `DATABASE_URL` is explicitly configured to a custom or remote database, `ADMIN_KEY` is mandatory to prevent exposing admin routes with default dev secrets.
+   - Tests in `internal/config/config_test.go` verify all security invariants.
+
+4. **Strict Owner-Token Lease Fencing ([`internal/repository/postgres/idempotency_repo.go`](file:///c:/Go/src/wallet-transfer-assignment/internal/repository/postgres/idempotency_repo.go#L130-L170))**:
+   - Enforced non-empty `OwnerToken` on all `UpdateIdempotency` calls; returns `ErrInvalidIdempotencyKey` if empty.
+   - Removed un-fenced `WHERE idempotency_key = $...` fallback branch, guaranteeing that every update is strictly fenced by `owner_token = $6`.
+   - `ReserveIdempotency` automatically generates a UUID `OwnerToken` if not pre-populated.
+
+5. **Atomic Pending-to-Terminal Transfer State Transitions ([`internal/repository/postgres/transfer_repo.go`](file:///c:/Go/src/wallet-transfer-assignment/internal/repository/postgres/transfer_repo.go#L40-L65))**:
+   - Guarded `UpdateTransferStatus` with `WHERE id = $4 AND status = 'PENDING'`.
+   - If 0 rows are affected, queries the transfer: if found in a terminal state (`PROCESSED` or `FAILED`), returns `domain.ErrInvalidStateTransition`; if non-existent, returns `domain.ErrTransferNotFound`.
+   - Verified via `TestTransferRepository_PendingToTerminalStatusEnforcement`.
+
+6. **Database Constraint Triggers Enforcing Transfer Status at Commit ([`migrations/000001_init_schema.sql`](file:///c:/Go/src/wallet-transfer-assignment/migrations/000001_init_schema.sql#L100-L160))**:
+   - `trg_check_ledger_pair` deferred constraint trigger asserts that the referenced transfer row is strictly `status = 'PROCESSED'` at commit time.
+   - `trg_check_transfer_processed` deferred constraint trigger asserts that `FAILED` transfers cannot have ledger entries, and `PROCESSED` transfers must have exactly one balanced DEBIT/CREDIT pair.
+   - Verified via `TestDatabaseTriggers_RejectLedgerEntriesForFailedTransfer`.
+
+7. **Separation of Role Provisioning from Schema Migrations ([`migrations/000001_init_schema.sql`](file:///c:/Go/src/wallet-transfer-assignment/migrations/000001_init_schema.sql), [`scripts/init-user.sql`](file:///c:/Go/src/wallet-transfer-assignment/scripts/init-user.sql))**:
+   - Removed role creation (`CREATE ROLE wallet_app`, `CREATE ROLE wallet_test_user`) and table ownership statements from `000001_init_schema.sql`.
+   - Role provisioning and database initialization (`wallet_db` and `wallet_test_db`) are maintained in `scripts/init-user.sql` for Docker Compose, with least-privilege DML (`SELECT, INSERT` on ledger, no `UPDATE`/`DELETE`).
+
+8. **Advisory Lock Cancellation Test Redesign ([`migrations/migrations_test.go`](file:///c:/Go/src/wallet-transfer-assignment/migrations/migrations_test.go#L40-L80))**:
+   - Redesigned `TestMigrations_CanceledContextReleasesAdvisoryLock` to hold an intentional advisory lock (888999) on a separate connection to block `Migrate`, cancel its context while waiting, and verify that releasing the blocker allows a subsequent migration attempt to acquire the lock and succeed without hanging.
+
+9. **Robust Transaction Rollback & Test DB Cleanup**:
+   - `TxManager.ExecuteInTx` uses an independent 5-second timeout context for `tx.Rollback(rollbackCtx)` on failure.
+   - `pkg/testutil/db.go` issues `SELECT pg_advisory_unlock(777888)` before releasing connection on lock acquisition errors.
+   - Propagated `UpdateIdempotency` errors during stale recovery in `internal/service/transfer_service.go`.
+   - `WalletService` requires a non-nil `TxManager` in `CreateWallet` and `ReconcileBalance`.
+
+10. **Documentation Updates**:
+    - Added executable "How to Run" (Docker Compose, Go commands, sample `curl` requests) and "How to Test" (`TEST_DATABASE_URL`, `go test`, `go vet`) sections to `problem_understanding.md`.
+    - Updated `walkthrough.md` and `AI_DISCLOSURE.md`.
+
+All tests pass (`go test -count=1 ./...`) and `go vet ./...` succeeds with zero warnings.
+
+
 

@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
 
 	"wallet-transfer-assignment/internal/domain"
 	"wallet-transfer-assignment/internal/repository"
@@ -26,6 +26,9 @@ func (r *idempotencyRepository) ReserveIdempotency(ctx context.Context, record *
 	now := time.Now().UTC()
 	record.CreatedAt = now
 	record.UpdatedAt = now
+	if record.OwnerToken == "" {
+		record.OwnerToken = uuid.NewString()
+	}
 
 	insertQuery := `
 		INSERT INTO idempotency_records (idempotency_key, request_hash, owner_token, status, created_at, updated_at)
@@ -152,41 +155,24 @@ func (r *idempotencyRepository) GetIdempotency(ctx context.Context, key string) 
 }
 
 func (r *idempotencyRepository) UpdateIdempotency(ctx context.Context, record *domain.IdempotencyRecord) error {
-	var query string
-	var cmdTag pgconn.CommandTag
-	var err error
-
-	if record.OwnerToken != "" {
-		query = `
-			UPDATE idempotency_records
-			SET transfer_id = $1, status = $2, response_code = $3, response_body = $4, updated_at = $5
-			WHERE idempotency_key = $6 AND owner_token = $7
-		`
-		cmdTag, err = r.db.Exec(ctx, query,
-			record.TransferID,
-			string(record.Status),
-			record.ResponseCode,
-			record.ResponseBody,
-			time.Now().UTC(),
-			record.IdempotencyKey,
-			record.OwnerToken,
-		)
-	} else {
-		query = `
-			UPDATE idempotency_records
-			SET transfer_id = $1, status = $2, response_code = $3, response_body = $4, updated_at = $5
-			WHERE idempotency_key = $6
-		`
-		cmdTag, err = r.db.Exec(ctx, query,
-			record.TransferID,
-			string(record.Status),
-			record.ResponseCode,
-			record.ResponseBody,
-			time.Now().UTC(),
-			record.IdempotencyKey,
-		)
+	if record.OwnerToken == "" {
+		return errors.New("owner token is required for idempotency update")
 	}
 
+	query := `
+		UPDATE idempotency_records
+		SET transfer_id = $1, status = $2, response_code = $3, response_body = $4, updated_at = $5
+		WHERE idempotency_key = $6 AND owner_token = $7
+	`
+	cmdTag, err := r.db.Exec(ctx, query,
+		record.TransferID,
+		string(record.Status),
+		record.ResponseCode,
+		record.ResponseBody,
+		time.Now().UTC(),
+		record.IdempotencyKey,
+		record.OwnerToken,
+	)
 	if err != nil {
 		return fmt.Errorf("failed to update idempotency record: %w", err)
 	}

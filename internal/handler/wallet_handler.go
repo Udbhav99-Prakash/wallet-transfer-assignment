@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"wallet-transfer-assignment/internal/domain"
@@ -160,7 +161,29 @@ func (h *WalletHandler) GetWalletLedger(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	entries, err := h.walletService.GetWalletLedger(r.Context(), wallet_id)
+	limit := 50
+	offset := 0
+	if lStr := r.URL.Query().Get("limit"); lStr != "" {
+		l, err := strconv.Atoi(lStr)
+		if err != nil || l <= 0 {
+			WriteError(w, http.StatusBadRequest, "invalid limit: must be a positive integer")
+			return
+		}
+		if l > 100 {
+			l = 100
+		}
+		limit = l
+	}
+	if oStr := r.URL.Query().Get("offset"); oStr != "" {
+		o, err := strconv.Atoi(oStr)
+		if err != nil || o < 0 {
+			WriteError(w, http.StatusBadRequest, "invalid offset: must be a non-negative integer")
+			return
+		}
+		offset = o
+	}
+
+	entries, err := h.walletService.GetWalletLedger(r.Context(), wallet_id, limit, offset)
 	if err != nil {
 		if errors.Is(err, domain.ErrWalletNotFound) {
 			WriteError(w, http.StatusNotFound, "wallet not found")
@@ -169,6 +192,10 @@ func (h *WalletHandler) GetWalletLedger(w http.ResponseWriter, r *http.Request) 
 		log.Printf("[ERROR] failed to get ledger for wallet %s: %v", wallet_id, err)
 		WriteError(w, http.StatusInternalServerError, "internal server error")
 		return
+	}
+
+	if entries == nil {
+		entries = []domain.LedgerEntry{}
 	}
 
 	WriteJSON(w, http.StatusOK, entries)

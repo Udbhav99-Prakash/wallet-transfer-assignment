@@ -148,7 +148,7 @@ func TestTransferService_Success(t *testing.T) {
 	}
 
 	// 4. Verify double-entry ledger entries
-	ledgerW1, err := walletSvc.GetWalletLedger(ctx, w1.ID)
+	ledgerW1, err := walletSvc.GetWalletLedger(ctx, w1.ID, 50, 0)
 	if err != nil {
 		t.Fatalf("failed to get wallet 1 ledger: %v", err)
 	}
@@ -160,7 +160,7 @@ func TestTransferService_Success(t *testing.T) {
 		t.Fatalf("expected debit entry of 150, got %+v", ledgerW1[1])
 	}
 
-	ledgerW2, err := walletSvc.GetWalletLedger(ctx, w2.ID)
+	ledgerW2, err := walletSvc.GetWalletLedger(ctx, w2.ID, 50, 0)
 	if err != nil {
 		t.Fatalf("failed to get wallet 2 ledger: %v", err)
 	}
@@ -1177,7 +1177,7 @@ func TestWalletService_CreateWallet_TransactionalRollback(t *testing.T) {
 	}
 
 	// 3. Verify no orphaned ledger entries were created for failedID
-	entries, err := repos.Ledger.GetLedgerByWalletID(ctx, failedID)
+	entries, err := repos.Ledger.GetLedgerByWalletID(ctx, failedID, 50, 0)
 	if err != nil {
 		t.Fatalf("failed to get ledger for failed wallet: %v", err)
 	}
@@ -1789,7 +1789,7 @@ func TestLedgerRepository_DeterministicOrdering_TieBreaker(t *testing.T) {
 		}
 	}
 
-	entries, err := repos.Ledger.GetLedgerByWalletID(ctx, w.ID)
+	entries, err := repos.Ledger.GetLedgerByWalletID(ctx, w.ID, 10, 0)
 	if err != nil {
 		t.Fatalf("failed to get ledger: %v", err)
 	}
@@ -1801,6 +1801,15 @@ func TestLedgerRepository_DeterministicOrdering_TieBreaker(t *testing.T) {
 	if entries[0].ID != "a_entry" || entries[1].ID != "b_entry" || entries[2].ID != "c_entry" {
 		t.Fatalf("expected deterministic ID tie-breaking [a_entry, b_entry, c_entry], got [%s, %s, %s]",
 			entries[0].ID, entries[1].ID, entries[2].ID)
+	}
+
+	// Verify pagination: limit=1, offset=1 should return exactly b_entry
+	page, err := repos.Ledger.GetLedgerByWalletID(ctx, w.ID, 1, 1)
+	if err != nil {
+		t.Fatalf("failed to get paginated ledger page: %v", err)
+	}
+	if len(page) != 1 || page[0].ID != "b_entry" {
+		t.Fatalf("expected page with exactly [b_entry], got %+v", page)
 	}
 }
 
@@ -2319,5 +2328,170 @@ func TestWalletService_CreateWallet_SystemTreasuryIDForbidden(t *testing.T) {
 	})
 	if !errors.Is(err, domain.ErrWalletAlreadyExists) {
 		t.Fatalf("expected ErrWalletAlreadyExists when creating wallet with system_treasury ID, got: %v", err)
+	}
+}
+
+func TestTransferRepository_PendingToTerminalStatusEnforcement(t *testing.T) {
+	ctx := context.Background()
+	_, _, pool, repos := setupServicesWithPool(t)
+	txManager := postgres.NewTxManager(pool)
+
+	w1ID := "w_status_1_" + uuid.NewString()
+	w2ID := "w_status_2_" + uuid.NewString()
+	if err := repos.Wallets.CreateWallet(ctx, &domain.Wallet{
+		ID:       w1ID,
+		Name:     "Sender",
+		Balance:  1000,
+		Currency: "USD",
+	}); err != nil {
+		t.Fatalf("failed to create wallet 1: %v", err)
+	}
+	if err := repos.Wallets.CreateWallet(ctx, &domain.Wallet{
+		ID:       w2ID,
+		Name:     "Receiver",
+		Balance:  1000,
+		Currency: "USD",
+	}); err != nil {
+		t.Fatalf("failed to create wallet 2: %v", err)
+	}
+
+	// 1. Create a transfer and transition PENDING -> PROCESSED atomically with ledger entries
+	transferID := uuid.NewString()
+	transfer := &domain.Transfer{
+		ID:             transferID,
+		IdempotencyKey: "test_status_enforce_" + uuid.NewString(),
+		FromWalletID:   w1ID,
+		ToWalletID:     w2ID,
+		Amount:         100,
+		Status:         domain.TransferStatusPending,
+	}
+	if err := repos.Transfers.CreateTransfer(ctx, transfer); err != nil {
+		t.Fatalf("failed to create transfer: %v", err)
+	}
+
+	now := time.Now().UTC()
+	err := txManager.ExecuteInTx(ctx, func(txRepos repository.Repositories) error {
+		if err := txRepos.Transfers.UpdateTransferStatus(ctx, transferID, domain.TransferStatusProcessed, nil); err != nil {
+			return err
+		}
+		return txRepos.Ledger.CreateLedgerEntries(ctx,
+			domain.LedgerEntry{ID: uuid.NewString(), TransferID: transferID, WalletID: w1ID, Type: domain.LedgerEntryTypeDebit, Amount: 100, CreatedAt: now},
+			domain.LedgerEntry{ID: uuid.NewString(), TransferID: transferID, WalletID: w2ID, Type: domain.LedgerEntryTypeCredit, Amount: 100, CreatedAt: now},
+		)
+	})
+	if err != nil {
+		t.Fatalf("expected atomic PENDING -> PROCESSED with ledger entries to succeed, got %v", err)
+	}
+
+	// 2. Attempting to transition already-terminal PROCESSED transfer to FAILED must fail with ErrInvalidStateTransition
+	failReason := "duplicate attempt"
+	err = repos.Transfers.UpdateTransferStatus(ctx, transferID, domain.TransferStatusFailed, &failReason)
+	if !errors.Is(err, domain.ErrInvalidStateTransition) {
+		t.Fatalf("expected ErrInvalidStateTransition when transitioning from terminal PROCESSED state, got %v", err)
+	}
+
+	// 3. Create another transfer and transition PENDING -> FAILED
+	transfer2ID := uuid.NewString()
+	transfer2 := &domain.Transfer{
+		ID:             transfer2ID,
+		IdempotencyKey: "test_status_enforce_2_" + uuid.NewString(),
+		FromWalletID:   w1ID,
+		ToWalletID:     w2ID,
+		Amount:         50,
+		Status:         domain.TransferStatusPending,
+	}
+	if err := repos.Transfers.CreateTransfer(ctx, transfer2); err != nil {
+		t.Fatalf("failed to create transfer 2: %v", err)
+	}
+	failedReason := "insufficient funds"
+	if err := repos.Transfers.UpdateTransferStatus(ctx, transfer2ID, domain.TransferStatusFailed, &failedReason); err != nil {
+		t.Fatalf("expected transition PENDING -> FAILED to succeed, got %v", err)
+	}
+
+	// Attempting to transition already-terminal FAILED transfer must fail with ErrInvalidStateTransition
+	err = repos.Transfers.UpdateTransferStatus(ctx, transfer2ID, domain.TransferStatusProcessed, nil)
+	if !errors.Is(err, domain.ErrInvalidStateTransition) {
+		t.Fatalf("expected ErrInvalidStateTransition when transitioning from terminal FAILED state, got %v", err)
+	}
+
+	// 4. Attempting to transition non-existent transfer must fail with ErrTransferNotFound
+	err = repos.Transfers.UpdateTransferStatus(ctx, "non_existent_id", domain.TransferStatusProcessed, nil)
+	if !errors.Is(err, domain.ErrTransferNotFound) {
+		t.Fatalf("expected ErrTransferNotFound for non-existent transfer, got %v", err)
+	}
+}
+
+func TestDatabaseTriggers_RejectLedgerEntriesForFailedTransfer(t *testing.T) {
+	ctx := context.Background()
+	_, walletSvc, pool, _ := setupServicesWithPool(t)
+
+	w1, _ := walletSvc.CreateWallet(ctx, service.CreateWalletRequest{
+		ID:             "w_failed_trg_1",
+		Name:           "Sender",
+		InitialBalance: 1000,
+	})
+	w2, _ := walletSvc.CreateWallet(ctx, service.CreateWalletRequest{
+		ID:             "w_failed_trg_2",
+		Name:           "Receiver",
+		InitialBalance: 0,
+	})
+
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("failed to begin tx: %v", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	transferID := uuid.NewString()
+	_, err = tx.Exec(ctx, `
+		INSERT INTO transfers (id, idempotency_key, from_wallet_id, to_wallet_id, amount, status)
+		VALUES ($1, $2, $3, $4, 100, 'FAILED')
+	`, transferID, "idem_failed_"+uuid.NewString(), w1.ID, w2.ID)
+	if err != nil {
+		t.Fatalf("failed to insert failed transfer: %v", err)
+	}
+
+	// Insert ledger entries for a FAILED transfer
+	now := time.Now().UTC()
+	_, err = tx.Exec(ctx, `
+		INSERT INTO ledger_entries (id, transfer_id, wallet_id, type, amount, created_at)
+		VALUES ($1, $2, $3, 'DEBIT', 100, $5), ($4, $2, $6, 'CREDIT', 100, $5)
+	`, uuid.NewString(), transferID, w1.ID, uuid.NewString(), now, w2.ID)
+	if err != nil {
+		t.Fatalf("failed to insert ledger entries: %v", err)
+	}
+
+	// Committing must be rejected by database triggers
+	commitErr := tx.Commit(ctx)
+	if commitErr == nil {
+		t.Fatalf("expected commit to fail when committing ledger entries for a FAILED transfer, got nil")
+	}
+	if !strings.Contains(commitErr.Error(), "cannot commit FAILED transfer") &&
+		!strings.Contains(commitErr.Error(), "transfer status must be PROCESSED at commit time") {
+		t.Fatalf("expected trigger error rejecting ledger entries for failed transfer, got: %v", commitErr)
+	}
+}
+
+func TestWalletService_NilTxManagerFails(t *testing.T) {
+	ctx := context.Background()
+	_, _, repos := setupServicesWithRepos(t)
+
+	// Construct service with nil txManager
+	nilTxSvc := service.NewWalletService(nil, repos)
+
+	// CreateWallet must fail fast
+	_, err := nilTxSvc.CreateWallet(ctx, service.CreateWalletRequest{
+		ID:             "w_nil_tx",
+		Name:           "No Tx",
+		InitialBalance: 100,
+	})
+	if err == nil || !strings.Contains(err.Error(), "transaction manager is required") {
+		t.Fatalf("expected error containing 'transaction manager is required', got %v", err)
+	}
+
+	// ReconcileBalance must also fail fast
+	_, _, _, err = nilTxSvc.ReconcileBalance(ctx, "w_nil_tx")
+	if err == nil || !strings.Contains(err.Error(), "transaction manager is required") {
+		t.Fatalf("expected error containing 'transaction manager is required', got %v", err)
 	}
 }

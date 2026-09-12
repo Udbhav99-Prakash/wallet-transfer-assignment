@@ -44,6 +44,35 @@ func TestWallet_DebitAndCredit(t *testing.T) {
 	if err := w.Credit(-10); err != domain.ErrInvalidAmount {
 		t.Fatalf("expected ErrInvalidAmount, got %v", err)
 	}
+
+	// Test CanDebit predicate
+	wallet := &domain.Wallet{ID: "w2", Balance: 100}
+	if !wallet.CanDebit(50) {
+		t.Fatalf("expected CanDebit(50) to be true for balance 100")
+	}
+	if !wallet.CanDebit(100) {
+		t.Fatalf("expected CanDebit(100) to be true for balance 100")
+	}
+	if wallet.CanDebit(150) {
+		t.Fatalf("expected CanDebit(150) to be false for balance 100")
+	}
+	if wallet.CanDebit(0) {
+		t.Fatalf("expected CanDebit(0) to be false (amount must be strictly positive)")
+	}
+	if wallet.CanDebit(-10) {
+		t.Fatalf("expected CanDebit(-10) to be false for negative amount")
+	}
+
+	// Test CanCredit predicate
+	if !wallet.CanCredit(50) {
+		t.Fatalf("expected CanCredit(50) to be true")
+	}
+	if wallet.CanCredit(0) {
+		t.Fatalf("expected CanCredit(0) to be false (amount must be strictly positive)")
+	}
+	if wallet.CanCredit(-10) {
+		t.Fatalf("expected CanCredit(-10) to be false")
+	}
 	if err := w.Credit(0); err != domain.ErrInvalidAmount {
 		t.Fatalf("expected ErrInvalidAmount for 0, got %v", err)
 	}

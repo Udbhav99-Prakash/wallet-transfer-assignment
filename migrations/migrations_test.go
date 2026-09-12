@@ -3,6 +3,7 @@ package migrations_test
 import (
 	"context"
 	"testing"
+	"time"
 
 	"wallet-transfer-assignment/migrations"
 	"wallet-transfer-assignment/pkg/testutil"
@@ -19,18 +20,44 @@ func TestMigrations_Apply(t *testing.T) {
 
 func TestMigrations_CanceledContextReleasesAdvisoryLock(t *testing.T) {
 	pool := testutil.SetupTestDB(t)
+	ctx := context.Background()
 
-	canceledCtx, cancel := context.WithCancel(context.Background())
-	cancel()
+	const migrationAdvisoryLockID = 888999
 
-	// Migration with canceled context should fail immediately
-	err := migrations.Migrate(canceledCtx, pool)
-	if err == nil {
-		t.Fatalf("expected error with canceled context, got nil")
+	// 1. Acquire connection 1 and acquire advisory lock 888999, creating an intentional lock contention
+	blockerConn, err := pool.Acquire(ctx)
+	if err != nil {
+		t.Fatalf("failed to acquire blocker connection: %v", err)
+	}
+	defer blockerConn.Release()
+
+	if _, err := blockerConn.Exec(ctx, "SELECT pg_advisory_lock($1);", migrationAdvisoryLockID); err != nil {
+		t.Fatalf("failed to acquire blocker advisory lock: %v", err)
 	}
 
-	// Subsequent migration must acquire lock and succeed, proving lock was not leaked to the pool
-	if err := migrations.Migrate(context.Background(), pool); err != nil {
-		t.Fatalf("subsequent migration failed, advisory lock was likely leaked: %v", err)
+	// 2. Launch Migrate with a short timeout context.
+	// Migrate acquires a connection from the pool, attempts pg_advisory_lock(888999),
+	// blocks because blockerConn holds it, and times out while waiting.
+	timeoutCtx, cancel := context.WithTimeout(ctx, 150*time.Millisecond)
+	defer cancel()
+
+	migrateErr := migrations.Migrate(timeoutCtx, pool)
+	if migrateErr == nil {
+		t.Fatalf("expected Migrate to fail due to context deadline exceeded, got nil")
+	}
+
+	// 3. Release the blocker advisory lock on connection 1
+	if _, err := blockerConn.Exec(context.Background(), "SELECT pg_advisory_unlock($1);", migrationAdvisoryLockID); err != nil {
+		t.Fatalf("failed to release blocker advisory lock: %v", err)
+	}
+
+	// 4. Bound subsequent migration with a timeout.
+	// If the timed-out Migrate leaked lock 888999 or its connection back to the pool in a locked state,
+	// this call would block indefinitely until the timeout expires.
+	followUpCtx, followUpCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer followUpCancel()
+
+	if err := migrations.Migrate(followUpCtx, pool); err != nil {
+		t.Fatalf("subsequent migration failed; advisory lock was likely leaked to the pool: %v", err)
 	}
 }

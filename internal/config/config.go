@@ -31,8 +31,10 @@ func Load() (*Config, error) {
 	if env == "" {
 		env = os.Getenv("ENV")
 	}
+	// A missing environment is treated as non-development by default to prevent
+	// deployments with forgotten environment markers from running with development credentials.
 	if env == "" {
-		env = "development"
+		env = "production"
 	}
 
 	port := os.Getenv("PORT")
@@ -56,7 +58,9 @@ func Load() (*Config, error) {
 		adminKey = os.Getenv("ADMIN_API_KEY")
 	}
 	if adminKey == "" {
-		if isNonDevelopment(env) {
+		// In non-development environments, OR whenever a custom/explicit DATABASE_URL is configured,
+		// an explicit ADMIN_KEY is strictly required to prevent exposing admin routes with a known default secret.
+		if isNonDevelopment(env) || os.Getenv("DATABASE_URL") != "" {
 			return nil, fmt.Errorf("%w (environment: %s)", ErrMissingAdminKey, env)
 		}
 		adminKey = "admin-secret-dev"

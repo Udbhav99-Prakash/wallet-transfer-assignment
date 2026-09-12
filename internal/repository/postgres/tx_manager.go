@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -29,7 +30,10 @@ func (m *txManager) ExecuteInTx(ctx context.Context, fn func(txRepos repository.
 
 	defer func() {
 		// Rollback is a safe no-op if tx.Commit has already succeeded.
-		_ = tx.Rollback(ctx)
+		// Use an independent context with timeout so rollback completes even if the caller's context was canceled.
+		rollbackCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = tx.Rollback(rollbackCtx)
 	}()
 
 	repos := repository.Repositories{

@@ -9,10 +9,12 @@ import (
 )
 
 func TestConfig_Load_DevelopmentDefaults(t *testing.T) {
+	_ = os.Setenv("APP_ENV", "development")
+	defer os.Unsetenv("APP_ENV")
 	_ = os.Unsetenv("DATABASE_URL")
-	_ = os.Unsetenv("APP_ENV")
 	_ = os.Unsetenv("ENV")
 	_ = os.Unsetenv("PORT")
+	_ = os.Unsetenv("ADMIN_KEY")
 
 	cfg, err := config.Load()
 	if err != nil {
@@ -34,18 +36,48 @@ func TestConfig_Load_DevelopmentDefaults(t *testing.T) {
 	}
 }
 
-func TestConfig_Load_CustomDatabaseURL(t *testing.T) {
-	const customURL = "postgres://custom_user:secret@customhost:5432/custom_db?sslmode=require"
-	_ = os.Setenv("DATABASE_URL", customURL)
-	defer os.Unsetenv("DATABASE_URL")
+func TestConfig_Load_MissingEnvironmentTreatedAsNonDevelopment(t *testing.T) {
+	_ = os.Unsetenv("APP_ENV")
+	_ = os.Unsetenv("ENV")
+	_ = os.Unsetenv("DATABASE_URL")
+	_ = os.Unsetenv("ADMIN_KEY")
 
 	cfg, err := config.Load()
-	if err != nil {
-		t.Fatalf("expected no error with custom URL, got %v", err)
+	if err == nil {
+		t.Fatalf("expected error when environment is omitted, got cfg: %+v", cfg)
+	}
+	if !errors.Is(err, config.ErrMissingDatabaseURL) {
+		t.Fatalf("expected ErrMissingDatabaseURL when environment is omitted, got %v", err)
+	}
+}
+
+func TestConfig_Load_CustomDatabaseURLRequiresExplicitAdminKey(t *testing.T) {
+	const customURL = "postgres://custom_user:secret@customhost:5432/custom_db?sslmode=require"
+	_ = os.Setenv("APP_ENV", "development")
+	defer os.Unsetenv("APP_ENV")
+	_ = os.Setenv("DATABASE_URL", customURL)
+	defer os.Unsetenv("DATABASE_URL")
+	_ = os.Unsetenv("ADMIN_KEY")
+	_ = os.Unsetenv("ADMIN_API_KEY")
+
+	// Setting custom database URL without ADMIN_KEY must fail
+	cfg, err := config.Load()
+	if err == nil {
+		t.Fatalf("expected error when ADMIN_KEY is omitted for custom DATABASE_URL, got %+v", cfg)
+	}
+	if !errors.Is(err, config.ErrMissingAdminKey) {
+		t.Fatalf("expected ErrMissingAdminKey, got %v", err)
 	}
 
-	if cfg.DatabaseURL != customURL {
-		t.Fatalf("expected %q, got %q", customURL, cfg.DatabaseURL)
+	// With ADMIN_KEY provided, it succeeds
+	_ = os.Setenv("ADMIN_KEY", "custom-admin-key")
+	defer os.Unsetenv("ADMIN_KEY")
+	cfg, err = config.Load()
+	if err != nil {
+		t.Fatalf("expected success with explicit admin key and custom DB URL, got %v", err)
+	}
+	if cfg.DatabaseURL != customURL || cfg.AdminKey != "custom-admin-key" {
+		t.Fatalf("unexpected config values: %+v", cfg)
 	}
 }
 

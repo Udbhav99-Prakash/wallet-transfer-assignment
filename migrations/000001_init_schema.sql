@@ -77,6 +77,10 @@ BEGIN
     IF NEW.transfer_id IS NOT NULL THEN
         SELECT * INTO transfer_rec FROM transfers WHERE id = NEW.transfer_id;
         IF FOUND THEN
+            IF transfer_rec.status <> 'PROCESSED' THEN
+                RAISE EXCEPTION 'invalid ledger pair for transfer %: transfer status must be PROCESSED at commit time, got %', NEW.transfer_id, transfer_rec.status;
+            END IF;
+
             SELECT COUNT(*), COALESCE(SUM(amount), 0) INTO debit_count, debit_sum
             FROM ledger_entries
             WHERE transfer_id = NEW.transfer_id AND type = 'DEBIT' AND wallet_id = transfer_rec.from_wallet_id;
@@ -102,7 +106,7 @@ FOR EACH ROW
 EXECUTE FUNCTION check_ledger_pair_integrity();
 
 -- Database-level constraint trigger on transfers enforcing that no transfer can be committed as PROCESSED
--- without an exact, balanced double-entry pair existing in ledger_entries.
+-- without an exact, balanced double-entry pair existing in ledger_entries, and no FAILED transfer can have ledger entries.
 CREATE OR REPLACE FUNCTION check_transfer_processed_ledger_pair()
 RETURNS TRIGGER AS $$
 DECLARE
@@ -123,6 +127,14 @@ BEGIN
         IF debit_count <> 1 OR credit_count <> 1 OR debit_sum <> NEW.amount OR credit_sum <> NEW.amount THEN
             RAISE EXCEPTION 'cannot commit PROCESSED transfer %: requires exactly 1 DEBIT on from_wallet (%) and 1 CREDIT on to_wallet (%) matching transfer amount (%)',
                 NEW.id, NEW.from_wallet_id, NEW.to_wallet_id, NEW.amount;
+        END IF;
+    ELSIF NEW.status = 'FAILED' THEN
+        SELECT COUNT(*) INTO debit_count
+        FROM ledger_entries
+        WHERE transfer_id = NEW.id;
+
+        IF debit_count > 0 THEN
+            RAISE EXCEPTION 'cannot commit FAILED transfer % with existing ledger entries', NEW.id;
         END IF;
     END IF;
     RETURN NEW;
@@ -150,16 +162,14 @@ BEFORE DELETE OR UPDATE ON ledger_entries
 FOR EACH ROW
 EXECUTE FUNCTION prevent_ledger_mutation();
 
--- Ensure least-privileged application role exists and has appropriate table permissions
+-- Ensure least-privileged application role has appropriate runtime table permissions if it exists
 DO $$
 BEGIN
-    BEGIN
-        IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'wallet_app') THEN
-            CREATE ROLE wallet_app WITH LOGIN PASSWORD 'wallet_app_password';
-        END IF;
-        GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO wallet_app;
-        GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO wallet_app;
-    EXCEPTION WHEN insufficient_privilege THEN
-        NULL;
-    END;
+    IF EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'wallet_app') THEN
+        GRANT SELECT, INSERT, UPDATE ON TABLE wallets, transfers, idempotency_records TO wallet_app;
+        GRANT DELETE ON TABLE idempotency_records TO wallet_app;
+        GRANT SELECT, INSERT ON TABLE ledger_entries, schema_migrations TO wallet_app;
+    END IF;
+EXCEPTION WHEN insufficient_privilege THEN
+    NULL;
 END $$;

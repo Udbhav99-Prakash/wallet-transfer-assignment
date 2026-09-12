@@ -111,11 +111,22 @@ func (r *transferRepository) UpdateTransferStatus(ctx context.Context, id string
 	query := `
 		UPDATE transfers
 		SET status = $1, failure_reason = $2, updated_at = $3
-		WHERE id = $4
+		WHERE id = $4 AND status = 'PENDING'
 	`
-	_, err := r.db.Exec(ctx, query, string(status), failureReason, time.Now().UTC(), id)
+	cmdTag, err := r.db.Exec(ctx, query, string(status), failureReason, time.Now().UTC(), id)
 	if err != nil {
 		return fmt.Errorf("failed to update transfer status: %w", err)
+	}
+	if cmdTag.RowsAffected() == 0 {
+		var existingStatus string
+		checkErr := r.db.QueryRow(ctx, "SELECT status FROM transfers WHERE id = $1", id).Scan(&existingStatus)
+		if checkErr != nil {
+			if errors.Is(checkErr, pgx.ErrNoRows) {
+				return domain.ErrTransferNotFound
+			}
+			return fmt.Errorf("failed to verify transfer existence: %w", checkErr)
+		}
+		return domain.ErrInvalidStateTransition
 	}
 	return nil
 }

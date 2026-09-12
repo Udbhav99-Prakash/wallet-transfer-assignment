@@ -116,7 +116,9 @@ func (s *TransferService) ExecuteTransfer(ctx context.Context, req CreateTransfe
 				existing.TransferID = &existingTx.ID
 				existing.ResponseCode = respCode
 				existing.ResponseBody = string(respBytes)
-				_ = s.repos.Idempotency.UpdateIdempotency(ctx, existing)
+				if updateErr := s.repos.Idempotency.UpdateIdempotency(ctx, existing); updateErr != nil {
+					return nil, fmt.Errorf("failed to finalize recovered idempotency record: %w", updateErr)
+				}
 				if status == domain.IdempotencyStatusFailed {
 					return resp, s.mapFailureReasonToError(failureReason, respCode)
 				}

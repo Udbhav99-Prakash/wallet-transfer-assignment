@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -122,14 +123,11 @@ func (s *WalletService) CreateWallet(ctx context.Context, req CreateWalletReques
 		return nil
 	}
 
-	if s.txManager != nil {
-		if err := s.txManager.ExecuteInTx(ctx, createOp); err != nil {
-			return nil, err
-		}
-	} else {
-		if err := createOp(s.repos); err != nil {
-			return nil, err
-		}
+	if s.txManager == nil {
+		return nil, errors.New("transaction manager is required for wallet creation")
+	}
+	if err := s.txManager.ExecuteInTx(ctx, createOp); err != nil {
+		return nil, err
 	}
 
 	return wallet, nil
@@ -140,13 +138,13 @@ func (s *WalletService) GetWallet(ctx context.Context, id string) (*domain.Walle
 	return s.repos.Wallets.GetWalletByID(ctx, id)
 }
 
-// GetWalletLedger retrieves all ledger entries for a wallet.
-func (s *WalletService) GetWalletLedger(ctx context.Context, walletID string) ([]domain.LedgerEntry, error) {
+// GetWalletLedger retrieves paginated ledger entries for a wallet.
+func (s *WalletService) GetWalletLedger(ctx context.Context, walletID string, limit, offset int) ([]domain.LedgerEntry, error) {
 	// Ensure wallet exists
 	if _, err := s.repos.Wallets.GetWalletByID(ctx, walletID); err != nil {
 		return nil, err
 	}
-	return s.repos.Ledger.GetLedgerByWalletID(ctx, walletID)
+	return s.repos.Ledger.GetLedgerByWalletID(ctx, walletID, limit, offset)
 }
 
 // ReconcileBalance audits stored balance against the sum of historical ledger entries.
@@ -176,14 +174,11 @@ func (s *WalletService) ReconcileBalance(ctx context.Context, walletID string) (
 		return nil
 	}
 
-	if s.txManager != nil {
-		if err := s.txManager.ExecuteInTx(ctx, reconcileOp); err != nil {
-			return 0, 0, false, err
-		}
-	} else {
-		if err := reconcileOp(s.repos); err != nil {
-			return 0, 0, false, err
-		}
+	if s.txManager == nil {
+		return 0, 0, false, errors.New("transaction manager is required for balance reconciliation")
+	}
+	if err := s.txManager.ExecuteInTx(ctx, reconcileOp); err != nil {
+		return 0, 0, false, err
 	}
 	return storedBalance, ledgerBalance, isBalanced, nil
 }

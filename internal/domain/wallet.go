@@ -18,8 +18,11 @@ type Wallet struct {
 	UpdatedAt time.Time `json:"updatedAt"`
 }
 
-// CanDebit returns true if the wallet has sufficient funds to cover the requested amount.
+// CanDebit returns true if the wallet has sufficient funds to cover the requested amount and the amount is positive.
 func (w *Wallet) CanDebit(amount int64) bool {
+	if amount <= 0 {
+		return false
+	}
 	return w.Balance >= amount
 }
 

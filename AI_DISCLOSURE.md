@@ -48,7 +48,7 @@ Antigravity was employed as an active **pair programmer and systems design sound
 
 ## 3. Session Transcript & Prompt Records
 
-The complete transcript of all 65 interaction turns—including exact prompt text, tool invocations, and AI responses—is preserved in this repository:
+The complete transcript of all 66 interaction turns—including exact prompt text, tool invocations, and AI responses—is preserved in this repository:
 - **Readable Session Transcript**: [`AI_TRANSCRIPT.md`](./AI_TRANSCRIPT.md)
 - **Raw Agent Interaction Log**: Persisted in the session metadata logs.
 
@@ -56,7 +56,7 @@ The complete transcript of all 65 interaction turns—including exact prompt tex
 
 ## 4. Chronological List of All Prompts
 
-Below is the complete chronological log of all 65 explicit prompts provided during the development session:
+Below is the complete chronological log of all 66 explicit prompts provided during the development session:
 
 | # | Timestamp (UTC) | Phase | User Prompt |
 |---|---|---|---|
@@ -125,6 +125,7 @@ Below is the complete chronological log of all 65 explicit prompts provided duri
 | **63** | `2026-09-12 08:33:43` | Review Fixes | *In [migrations/migrations.go]: If the advisory-lock call fails after PostgreSQL has actually acquired the session lock (for example, a lost response or canceled context), the unlock defer has not been registered yet. lockConn.Release() can then return a session holding 888999 to the pool, causing later migration attempts to block indefinitely. Register the unlock defer immediately after acquiring the connection, before attempting pg_advisory_lock, or use a transaction-scoped advisory lock.* |
 | **64** | `2026-09-12 08:38:00` | Review Fixes | *In [migrations/000001_init_schema.sql]: These deferred triggers and the immutability trigger are the database's last line of defense for the ledger, but the integration tests only validate pair shape in CreateLedgerEntries before SQL executes and exercise valid application transfers. They do not attempt an invalid wallet/type pair or an UPDATE/DELETE against PostgreSQL, so a broken trigger definition could pass the suite while allowing unbalanced or mutable ledger data. Add integration assertions that malformed pairs fail at commit and ledger mutations are rejected.* |
 | **65** | `2026-09-12 08:44:00` | Review Fixes | *In [internal/domain/errors.go]: ErrInvalidIdempotencyKey is described as covering empty and overlong keys, but ExecuteTransfer returns ErrMissingIdempotencyKey for an empty key. This makes the error text misleading wherever the length-specific error is surfaced; make this message describe only the overlong-key condition or align the service behavior.* |
+| **66** | `2026-09-12 09:15:00` | Review Fixes | *[Comprehensive Review on PR #169: CanDebit strict positive amount, bounded ledger pagination, safe-by-default APP_ENV & explicit ADMIN_KEY requirement, owner-token lease update fencing, atomic pending-to-terminal transfer status enforcement, commit-time transfer status trigger verification, migration role separation, and post-acquisition advisory lock cancellation test redesign]* |
 
 ---
 
@@ -178,6 +179,21 @@ The author is fully prepared to explain and defend every design decision and lin
      - `TestDatabaseConstraints_RejectDuplicateLedgerEntryType`: asserts that duplicate entry types (e.g. 2 `DEBIT` records for the same transfer) fail immediately under unique index `idx_ledger_entries_transfer_type`.
      - `TestDatabaseTriggers_MalformedLedgerPairFailsAtCommit`: asserts that single debits, single credits, mismatched source wallets, mismatched destination wallets, and differing debit/credit amounts fail at transaction `Commit()` under deferred constraint trigger `trg_check_ledger_pair` with `"invalid ledger pair for transfer"`.
      - `TestDatabaseTriggers_ProcessedTransferWithoutLedgerPairFailsAtCommit`: asserts that committing a transfer with `status = 'PROCESSED'` without balanced ledger entries fails at `Commit()` under deferred constraint trigger `trg_check_transfer_processed` with `"cannot commit PROCESSED transfer"`.
+12. **Strict Positive Debit Predicate**:
+   - Why `CanDebit(amount)` strictly requires `amount > 0 && w.Balance >= amount`: aligns with `CanCredit` and `Debit` validation, preventing callers using `CanDebit` from approving zero or negative debit requests.
+13. **Bounded Ledger History Pagination**:
+   - Why `GetLedgerByWalletID` enforces bounded limits (default 50, maximum 100) and offset parameters: unbounded materialization of historical financial rows would lead to memory bloat, high latency, and request timeouts for long-lived active wallets.
+14. **Safe-by-Default Configuration Security**:
+   - Why omitted `APP_ENV` defaults to `production` and requires explicit `DATABASE_URL` and `ADMIN_KEY`: avoids running in production with accidental development fallback credentials (`admin-secret-dev`), protecting sensitive admin endpoints.
+15. **Complete Owner-Token Lease Fencing**:
+   - Why all `UpdateIdempotency` calls must require a non-empty `OwnerToken` with `owner_token = $6` in the SQL predicate: eliminating un-fenced update fallbacks guarantees that no stale, expired, or non-leaseholding worker can overwrite or tamper with an active idempotency reservation.
+16. **Atomic Pending-to-Terminal Transfer Transitions**:
+   - Why `UpdateTransferStatus` enforces `WHERE id = $4 AND status = 'PENDING'`: once a transfer reaches a terminal state (`PROCESSED` or `FAILED`), it is immutable. Guarding the update with `status = 'PENDING'` and returning `domain.ErrInvalidStateTransition` if 0 rows are updated prevents concurrent retries, background workers, or timeout handlers from corrupting or overwriting terminal outcomes.
+17. **Commit-Time Transfer Status Database Triggers**:
+   - Why `trg_check_ledger_pair` verifies that the transfer's status is `PROCESSED` at commit time: ensures that a transaction cannot commit ledger entries for a transfer marked `FAILED` or left as `PENDING`.
+18. **Separation of Schema Definition from Role Provisioning**:
+   - Why role creation statements are kept in `scripts/init-user.sql` rather than `000001_init_schema.sql`: in cloud production environments, database users and roles are managed by DBAs or infrastructure-as-code (Terraform/IAM) with least privilege (`SELECT, INSERT` on ledger, no `UPDATE`/`DELETE`). Application migration scripts should define tables, triggers, and indexes without hardcoding role creation.
+
 
 
 

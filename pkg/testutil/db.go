@@ -76,6 +76,7 @@ func SetupTestDB(t *testing.T) *pgxpool.Pool {
 		t.Fatalf("failed to acquire connection for test advisory lock: %v", err)
 	}
 	if _, err := lockConn.Exec(ctx, "SELECT pg_advisory_lock(777888);"); err != nil {
+		_, _ = lockConn.Exec(context.Background(), "SELECT pg_advisory_unlock(777888);")
 		lockConn.Release()
 		t.Fatalf("failed to acquire pg_advisory_lock: %v", err)
 	}

@@ -765,3 +765,53 @@ func TestHandler_Transfer_UnsupportedMediaType(t *testing.T) {
 		t.Fatalf("expected 415 Unsupported Media Type for text/plain, got %d: %s", w.Code, w.Body.String())
 	}
 }
+
+func TestHandler_GetWalletLedger_Pagination(t *testing.T) {
+	router := setupTestServer(t)
+
+	// Create wallet
+	createBody, _ := json.Marshal(service.CreateWalletRequest{
+		ID:             "hw_page_1",
+		Name:           "Page Test Wallet",
+		InitialBalance: 0,
+	})
+	req := httptest.NewRequest(http.MethodPost, "/wallets", bytes.NewReader(createBody))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("failed to create wallet: %d", w.Code)
+	}
+
+	// 1. Valid pagination query params
+	getReq := httptest.NewRequest(http.MethodGet, "/wallets/hw_page_1/ledger?limit=10&offset=0", nil)
+	getRec := httptest.NewRecorder()
+	router.ServeHTTP(getRec, getReq)
+	if getRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for valid limit/offset, got %d: %s", getRec.Code, getRec.Body.String())
+	}
+
+	// 2. Negative limit -> 400 Bad Request
+	badLimitReq := httptest.NewRequest(http.MethodGet, "/wallets/hw_page_1/ledger?limit=-1", nil)
+	badLimitRec := httptest.NewRecorder()
+	router.ServeHTTP(badLimitRec, badLimitReq)
+	if badLimitRec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 Bad Request for negative limit, got %d", badLimitRec.Code)
+	}
+
+	// 3. Non-numeric limit -> 400 Bad Request
+	nonNumLimitReq := httptest.NewRequest(http.MethodGet, "/wallets/hw_page_1/ledger?limit=abc", nil)
+	nonNumLimitRec := httptest.NewRecorder()
+	router.ServeHTTP(nonNumLimitRec, nonNumLimitReq)
+	if nonNumLimitRec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 Bad Request for non-numeric limit, got %d", nonNumLimitRec.Code)
+	}
+
+	// 4. Negative offset -> 400 Bad Request
+	badOffsetReq := httptest.NewRequest(http.MethodGet, "/wallets/hw_page_1/ledger?offset=-5", nil)
+	badOffsetRec := httptest.NewRecorder()
+	router.ServeHTTP(badOffsetRec, badOffsetReq)
+	if badOffsetRec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 Bad Request for negative offset, got %d", badOffsetRec.Code)
+	}
+}
