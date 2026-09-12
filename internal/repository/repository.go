@@ -36,8 +36,8 @@ type IdempotencyRepository interface {
 	ReserveIdempotency(ctx context.Context, record *domain.IdempotencyRecord, staleTimeout time.Duration) (*domain.IdempotencyRecord, bool, error)
 	GetIdempotency(ctx context.Context, key string) (*domain.IdempotencyRecord, error)
 	UpdateIdempotency(ctx context.Context, record *domain.IdempotencyRecord) error
-	DeleteIdempotency(ctx context.Context, key string) error
 	DeleteInProgress(ctx context.Context, key string, ownerToken string) error
+	DeleteStaleInProgress(ctx context.Context, key string, ownerToken string, maxUpdatedAt time.Time) error
 	HeartbeatIdempotency(ctx context.Context, key string, ownerToken string) error
 }
 

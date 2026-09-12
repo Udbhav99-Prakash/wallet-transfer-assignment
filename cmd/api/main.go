@@ -28,6 +28,18 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	log.Println("Applying database migrations...")
+	migrationPool, err := postgres.NewPool(ctx, cfg.MigrationDatabaseURL)
+	if err != nil {
+		log.Fatalf("Failed to connect to migration database: %v", err)
+	}
+	if err := postgres.Migrate(ctx, migrationPool); err != nil {
+		migrationPool.Close()
+		log.Fatalf("Failed to apply migrations: %v", err)
+	}
+	migrationPool.Close()
+	log.Println("Database migrations applied successfully.")
+
 	if parsedURL, err := url.Parse(cfg.DatabaseURL); err == nil && parsedURL.Host != "" {
 		dbName := strings.TrimPrefix(parsedURL.Path, "/")
 		log.Printf("Connecting to PostgreSQL at host=%s db=%s ...", parsedURL.Host, dbName)
@@ -36,15 +48,9 @@ func main() {
 	}
 	pool, err := postgres.NewPool(ctx, cfg.DatabaseURL)
 	if err != nil {
-		log.Fatalf("Failed to connect to database: %v", err)
+		log.Fatalf("Failed to connect to runtime database: %v", err)
 	}
 	defer pool.Close()
-
-	log.Println("Applying database migrations...")
-	if err := postgres.Migrate(ctx, pool); err != nil {
-		log.Fatalf("Failed to apply migrations: %v", err)
-	}
-	log.Println("Database migrations applied successfully.")
 
 	// Construct repositories
 	repos := repository.Repositories{

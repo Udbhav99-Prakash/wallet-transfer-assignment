@@ -192,7 +192,7 @@ CREATE TABLE ledger_entries (
     type VARCHAR(16) NOT NULL CHECK (type IN ('DEBIT', 'CREDIT')),
     amount BIGINT NOT NULL CHECK (amount > 0),
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    CONSTRAINT check_null_transfer_credit CHECK (transfer_id IS NOT NULL OR type = 'CREDIT')
+    CONSTRAINT check_ledger_transfer_id CHECK (transfer_id IS NOT NULL OR (id = 'entry_system_treasury_opening' AND wallet_id = 'system_treasury' AND type = 'CREDIT'))
 );
 
 -- Idempotency tracking table

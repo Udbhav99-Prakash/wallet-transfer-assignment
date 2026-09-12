@@ -62,6 +62,9 @@ func (h *WalletHandler) CreateWallet(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		switch {
 		case errors.Is(err, domain.ErrWalletNameRequired),
+			errors.Is(err, domain.ErrInvalidWalletName),
+			errors.Is(err, domain.ErrInvalidWalletID),
+			errors.Is(err, domain.ErrInvalidCurrency),
 			errors.Is(err, domain.ErrNegativeBalance),
 			errors.Is(err, domain.ErrCurrencyMismatch),
 			errors.Is(err, domain.ErrBalanceOverflow):
@@ -107,6 +110,9 @@ func (h *WalletHandler) CreateAdminWallet(w http.ResponseWriter, r *http.Request
 	if err != nil {
 		switch {
 		case errors.Is(err, domain.ErrWalletNameRequired),
+			errors.Is(err, domain.ErrInvalidWalletName),
+			errors.Is(err, domain.ErrInvalidWalletID),
+			errors.Is(err, domain.ErrInvalidCurrency),
 			errors.Is(err, domain.ErrNegativeBalance),
 			errors.Is(err, domain.ErrCurrencyMismatch),
 			errors.Is(err, domain.ErrBalanceOverflow):

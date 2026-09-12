@@ -194,7 +194,7 @@ func (s *TransferService) ExecuteTransfer(ctx context.Context, req CreateTransfe
 			}
 			cleanupCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 			defer cancel()
-			_ = s.repos.Idempotency.DeleteInProgress(cleanupCtx, req.IdempotencyKey, existing.OwnerToken)
+			_ = s.repos.Idempotency.DeleteStaleInProgress(cleanupCtx, req.IdempotencyKey, existing.OwnerToken, existing.UpdatedAt)
 		}
 	}
 

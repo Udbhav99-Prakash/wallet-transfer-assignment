@@ -62,4 +62,13 @@ var (
 
 	// ErrSystemTreasuryRestricted is returned when a caller attempts to use system_treasury as a source or destination in transfers.
 	ErrSystemTreasuryRestricted = errors.New("system treasury cannot be used in public transfers")
+
+	// ErrInvalidWalletID is returned when the wallet ID exceeds maximum length (64 characters).
+	ErrInvalidWalletID = errors.New("wallet ID must not exceed 64 characters")
+
+	// ErrInvalidWalletName is returned when the wallet name exceeds maximum length (255 characters).
+	ErrInvalidWalletName = errors.New("wallet name must not exceed 255 characters")
+
+	// ErrInvalidCurrency is returned when the currency code is not a valid 3-letter code.
+	ErrInvalidCurrency = errors.New("currency must be a valid 3-letter code")
 )

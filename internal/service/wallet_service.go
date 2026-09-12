@@ -41,6 +41,9 @@ func (s *WalletService) CreateWallet(ctx context.Context, req CreateWalletReques
 	if req.Name == "" {
 		return nil, domain.ErrWalletNameRequired
 	}
+	if len(req.Name) > 255 {
+		return nil, domain.ErrInvalidWalletName
+	}
 	if req.InitialBalance < 0 {
 		return nil, domain.ErrNegativeBalance
 	}
@@ -52,6 +55,9 @@ func (s *WalletService) CreateWallet(ctx context.Context, req CreateWalletReques
 	if walletID == "" {
 		walletID = uuid.NewString()
 	}
+	if len(walletID) > 64 {
+		return nil, domain.ErrInvalidWalletID
+	}
 	if walletID == domain.SystemTreasuryWalletID {
 		return nil, domain.ErrWalletAlreadyExists
 	}
@@ -59,6 +65,8 @@ func (s *WalletService) CreateWallet(ctx context.Context, req CreateWalletReques
 	currency := req.Currency
 	if currency == "" {
 		currency = "USD"
+	} else if len(currency) != 3 {
+		return nil, domain.ErrInvalidCurrency
 	}
 
 	now := time.Now().UTC()

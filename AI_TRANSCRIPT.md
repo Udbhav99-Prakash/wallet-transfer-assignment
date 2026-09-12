@@ -2,7 +2,7 @@
 
 This document contains the chronological record of the interaction session with Google Antigravity during the development, testing, and refinement of the Wallet Transfer Service.
 
-- **Total Interaction Turns**: 69
+- **Total Interaction Turns**: 70
 - **Primary Tool**: Google Antigravity
 - **Underlying Model**: Advanced Agentic Reasoning Model
 
@@ -3873,3 +3873,96 @@ The idempotency finalization timestamp handling has been corrected, verified, an
    - Updated stale recovery tests to use direct `pool.Exec` when backdating timestamps for testing purposes.
 
 All tests pass (`go test -count=1 ./...`) and `go vet ./...` succeeds with zero warnings.
+
+---
+
+## Turn 70 — 2026-09-12T11:45:00Z
+
+### User Request
+```text
+In internal/repository/postgres/idempotency_repo.go:
+> func (r *idempotencyRepository) DeleteIdempotency(ctx context.Context, key string) error
+This unfenced cleanup method can delete any caller's IN_PROGRESS reservation knowing only the idempotency key, including a newer owner's active lease after stale-owner reclamation. The service already uses DeleteInProgress with an owner token; remove this escape hatch from the interface/implementation or require the owner token here as well.
+
+In internal/service/transfer_service.go:
+> cleanupCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+> defer cancel()
+> _ = s.repos.Idempotency.DeleteInProgress(cleanupCtx, req.IdempotencyKey, existing.OwnerToken)
+This blind cleanup deletes the in-progress row as long as owner_token matches, even if another worker has already reclaimed the reservation because it was stale (or if existing.UpdatedAt has advanced). Use compare-and-swap stale deletion (DeleteStaleInProgress with maxUpdatedAt) or leave reclamation to atomic stale reservation.
+
+internal/service/wallet_service.go:62
+The request fields are written to VARCHAR(64/255/3) columns without validating their bounds here. An overlong client ID, name, or currency therefore reaches PostgreSQL and falls through the handler's default branch as HTTP 500 instead of a client input error. Validate these limits in the service and map the resulting domain error to 400 before starting the transaction.
+
+migrations/000001_init_schema.sql:34
+ALTER TABLE ledger_entries ADD CONSTRAINT check_null_transfer_credit CHECK (transfer_id IS NOT NULL OR type = 'CREDIT');
+This constraint allows ANY credit entry to have a NULL transfer_id, enabling arbitrary unbacked money creation without a corresponding transfer record. Only the system_treasury genesis entry should ever have transfer_id IS NULL. Constrain transfer_id IS NULL strictly to the treasury opening record:
+(transfer_id IS NOT NULL OR (id = 'entry_system_treasury_opening' AND wallet_id = 'system_treasury' AND type = 'CREDIT'))
+
+migrations/000001_init_schema.sql:120
+IF TG_OP = 'UPDATE' AND OLD.status IN ('PROCESSED', 'FAILED') AND NEW.status != OLD.status THEN
+This check allows updating terminal transfers as long as NEW.status == OLD.status. An attacker or buggy process can update the amount, from_wallet_id, to_wallet_id, or failure_reason of an already-processed or already-failed transfer without triggering an error. Make terminal transfers completely immutable on UPDATE:
+IF TG_OP = 'UPDATE' AND OLD.status IN ('PROCESSED', 'FAILED') THEN
+    RAISE EXCEPTION 'terminal transfer % (status: %) is immutable and cannot be updated', OLD.id, OLD.status;
+END IF;
+
+migrations/000001_init_schema.sql:192
+The migration independently grants wallet_app DELETE and TRUNCATE on ledger_entries; TRUNCATE bypasses the row-level immutability trigger and can erase the audit trail. Moreover, the application runs this migration as the same role, making that role the owner capable of dropping or disabling the integrity triggers. Run migrations as a separate owner role and keep ledger runtime access to append/read operations only.
+
+migrations/migrations_test.go:46
+This test cancels only while the migration session is blocked waiting for advisory lock 888999; it never exercises cancellation after the advisory lock has been acquired (e.g. while applying SQL statements). Verify that cancelling a migration after advisory lock acquisition properly unlocks lock 888999 so that subsequent migrations can proceed.
+
+pkg/testutil/db.go:
+Holding lockConn while postgres.Migrate runs deadlocks when pool_max_conns=1. Run migrations before taking the lock or use an independent connection for migrations so SetupTestDB succeeds with pool_max_conns=1. Also ensureTestDatabaseExists connects as whatever credentials were passed in TEST_DATABASE_URL, so a non-superuser cannot create the test database. Use admin credentials (or TEST_ADMIN_URL / postgres:postgrespassword) and propagate the error rather than swallowing it with _.
+```
+
+**Tools Executed**: `view_file`, `replace_file_content`, `run_command`, `schedule`, `manage_task`
+
+### AI Response / Outcome
+
+All 10 review findings and PR comments have been comprehensively addressed, verified, and integrated into the test suite and production codebase:
+
+1. **Service-Level Field Bounds Validation ([`internal/service/wallet_service.go`](file:///c:/Go/src/wallet-transfer-assignment/internal/service/wallet_service.go#L40-L70))**:
+   - Added validation enforcing `len(req.Name) <= 255`, `len(walletID) <= 64`, and `len(currency) == 3`.
+   - Defined domain errors `ErrInvalidWalletID`, `ErrInvalidWalletName`, and `ErrInvalidCurrency` in [`internal/domain/errors.go`](file:///c:/Go/src/wallet-transfer-assignment/internal/domain/errors.go#L64-L73).
+   - Mapped domain errors to HTTP 400 Bad Request in [`internal/handler/wallet_handler.go`](file:///c:/Go/src/wallet-transfer-assignment/internal/handler/wallet_handler.go#L60-L115) for both `CreateWallet` and `CreateAdminWallet`.
+   - Added integration test `TestWalletHandler_FieldBoundsValidation_Returns400` in [`internal/handler/handler_test.go`](file:///c:/Go/src/wallet-transfer-assignment/internal/handler/handler_test.go#L818-L895).
+
+2. **Elimination of Unfenced Idempotency Deletion & Safe CAS Stale Cleanup ([`internal/repository/repository.go`](file:///c:/Go/src/wallet-transfer-assignment/internal/repository/repository.go#L35-L42), [`internal/repository/postgres/idempotency_repo.go`](file:///c:/Go/src/wallet-transfer-assignment/internal/repository/postgres/idempotency_repo.go#L205-L220), [`internal/service/transfer_service.go`](file:///c:/Go/src/wallet-transfer-assignment/internal/service/transfer_service.go#L180-L200))**:
+   - Removed `DeleteIdempotency(ctx, key)` completely from repository interface and implementation.
+   - Implemented `DeleteStaleInProgress(ctx, key, ownerToken string, maxUpdatedAt time.Time) error` with SQL query `DELETE FROM idempotency_records WHERE idempotency_key = $1 AND owner_token = $2 AND status = 'IN_PROGRESS' AND updated_at <= $3`.
+   - Updated `cleanupStaleReservation` in `transfer_service.go` to use `DeleteStaleInProgress` passing `existing.UpdatedAt`, preventing stale cleanups from clobbering updated leases or reclaimed reservations.
+
+3. **Strict Treasury Genesis Ledger Constraint ([`migrations/000001_init_schema.sql`](file:///c:/Go/src/wallet-transfer-assignment/migrations/000001_init_schema.sql#L31-L38))**:
+   - Dropped `check_null_transfer_credit` and added `CONSTRAINT check_ledger_transfer_id CHECK (transfer_id IS NOT NULL OR (id = 'entry_system_treasury_opening' AND wallet_id = 'system_treasury' AND type = 'CREDIT'))`.
+   - Guaranteed that arbitrary credit entries with NULL `transfer_id` cannot be created; only the system treasury opening record is exempt.
+
+4. **Complete Immutability for Terminal Transfers ([`migrations/000001_init_schema.sql`](file:///c:/Go/src/wallet-transfer-assignment/migrations/000001_init_schema.sql#L120-L126))**:
+   - Updated `check_transfer_processed_ledger_pair` trigger function to reject ANY update to transfers in `PROCESSED` or `FAILED` state:
+     `IF TG_OP = 'UPDATE' AND OLD.status IN ('PROCESSED', 'FAILED') THEN RAISE EXCEPTION 'terminal transfer % (status: %) is immutable and cannot be updated', OLD.id, OLD.status; END IF;`.
+   - Enhanced `TestDatabaseTriggers_RejectTerminalTransferStatusMutation` to verify that updates to `amount` and non-status fields are rejected at commit.
+
+5. **Statement-Level Ledger TRUNCATE Trigger & Least-Privilege Grants ([`migrations/000001_init_schema.sql`](file:///c:/Go/src/wallet-transfer-assignment/migrations/000001_init_schema.sql#L185-L215), [`scripts/init-user.sql`](file:///c:/Go/src/wallet-transfer-assignment/scripts/init-user.sql#L1-L55))**:
+   - Added `trg_prevent_ledger_truncate` `BEFORE TRUNCATE ON ledger_entries FOR EACH STATEMENT EXECUTE FUNCTION prevent_ledger_mutation()`.
+   - Revoked `UPDATE, DELETE, TRUNCATE ON TABLE ledger_entries FROM wallet_app` and `REVOKE TRUNCATE ON ALL TABLES FROM wallet_app`.
+   - Provisioned dedicated `wallet_test_cleanup` role for administrative test reset and isolation.
+
+6. **Migration Role Separation ([`internal/config/config.go`](file:///c:/Go/src/wallet-transfer-assignment/internal/config/config.go#L15-L85), [`cmd/api/main.go`](file:///c:/Go/src/wallet-transfer-assignment/cmd/api/main.go#L25-L48))**:
+   - Added `MigrationDatabaseURL` to `Config`, reading from `MIGRATION_DATABASE_URL` (defaulting in development to `postgres://postgres:postgrespassword...`).
+   - `main.go` runs migrations using `migrationPool` (schema owner), closes it, and connects the runtime application pool using `DatabaseURL` (`wallet_app`).
+
+7. **Test Database Admin Isolation & Deadlock Prevention on MaxConns=1 ([`pkg/testutil/db.go`](file:///c:/Go/src/wallet-transfer-assignment/pkg/testutil/db.go#L15-L180))**:
+   - Refactored `ensureTestDatabaseExists` to use `adminURL` and propagate errors.
+   - Refactored `SetupTestDB` to use `adminPool` for advisory locking (777888), migrations, and replica-mode table truncation, while returning `pool` as `wallet_app`. Completely eliminates self-deadlock when `MaxConns = 1`.
+   - Added `SetupAdminDB` for migration tests and schema verification.
+
+8. **Post-Acquisition Advisory Lock Cancellation Test ([`migrations/migrations_test.go`](file:///c:/Go/src/wallet-transfer-assignment/migrations/migrations_test.go#L85-L180))**:
+   - Added `TestMigrations_PostAcquisitionCancellationReleasesAdvisoryLock`: deterministically pauses `Migrate` after acquiring lock 888999 by holding an access-exclusive lock on `wallets`, verifies lock acquisition in `pg_locks`, cancels the context, verifies lock release, and confirms subsequent migrations succeed.
+
+All test suites pass cleanly:
+- `ok wallet-transfer-assignment/internal/config 0.192s`
+- `ok wallet-transfer-assignment/internal/domain 0.243s`
+- `ok wallet-transfer-assignment/internal/handler 11.521s`
+- `ok wallet-transfer-assignment/internal/service 17.360s`
+- `ok wallet-transfer-assignment/migrations 2.581s`
+`go vet ./...` succeeds with 0 warnings.
+

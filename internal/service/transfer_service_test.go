@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1491,48 +1492,51 @@ func TestLedgerRepository_EnforcesBalancedPair(t *testing.T) {
 
 func TestDatabaseTriggers_RejectLedgerMutation_UpdateAndDelete(t *testing.T) {
 	ctx := context.Background()
-	transferSvc, walletSvc, pool, _ := setupServicesWithPool(t)
+	adminPool := testutil.SetupAdminDB(t)
 
-	w1, err := walletSvc.CreateWallet(ctx, service.CreateWalletRequest{
+	repos := repository.Repositories{
+		Wallets:     postgres.NewWalletRepository(adminPool),
+		Transfers:   postgres.NewTransferRepository(adminPool),
+		Ledger:      postgres.NewLedgerRepository(adminPool),
+		Idempotency: postgres.NewIdempotencyRepository(adminPool),
+	}
+	txManager := postgres.NewTxManager(adminPool)
+	transferSvc := service.NewTransferService(txManager, repos)
+	walletSvc := service.NewWalletService(txManager, repos)
+
+	w1, _ := walletSvc.CreateWallet(ctx, service.CreateWalletRequest{
 		ID:             "w_mut_1",
-		Name:           "Sender",
+		Name:           "Mutation Test 1",
 		InitialBalance: 1000,
 	})
-	if err != nil {
-		t.Fatalf("failed to create wallet: %v", err)
-	}
-	w2, err := walletSvc.CreateWallet(ctx, service.CreateWalletRequest{
+	w2, _ := walletSvc.CreateWallet(ctx, service.CreateWalletRequest{
 		ID:             "w_mut_2",
-		Name:           "Receiver",
-		InitialBalance: 0,
+		Name:           "Mutation Test 2",
+		InitialBalance: 1000,
 	})
-	if err != nil {
-		t.Fatalf("failed to create wallet: %v", err)
-	}
 
-	// Perform a valid transfer to produce ledger entries
 	resp, err := transferSvc.ExecuteTransfer(ctx, service.CreateTransferRequest{
-		IdempotencyKey: "idem_ledger_mut_" + uuid.NewString(),
+		IdempotencyKey: "key_mut_" + uuid.NewString(),
 		FromWalletID:   w1.ID,
 		ToWalletID:     w2.ID,
-		Amount:         100,
+		Amount:         200,
 	})
 	if err != nil {
-		t.Fatalf("failed to execute transfer: %v", err)
+		t.Fatalf("transfer failed: %v", err)
 	}
 
 	var debitID, creditID string
-	err = pool.QueryRow(ctx, "SELECT id FROM ledger_entries WHERE transfer_id = $1 AND type = 'DEBIT'", resp.TransferID).Scan(&debitID)
+	err = adminPool.QueryRow(ctx, "SELECT id FROM ledger_entries WHERE transfer_id = $1 AND type = 'DEBIT'", resp.TransferID).Scan(&debitID)
 	if err != nil {
 		t.Fatalf("failed to query debit entry: %v", err)
 	}
-	err = pool.QueryRow(ctx, "SELECT id FROM ledger_entries WHERE transfer_id = $1 AND type = 'CREDIT'", resp.TransferID).Scan(&creditID)
+	err = adminPool.QueryRow(ctx, "SELECT id FROM ledger_entries WHERE transfer_id = $1 AND type = 'CREDIT'", resp.TransferID).Scan(&creditID)
 	if err != nil {
 		t.Fatalf("failed to query credit entry: %v", err)
 	}
 
 	// 1. Direct UPDATE on ledger_entries must be rejected by trg_prevent_ledger_mutation
-	_, updateErr := pool.Exec(ctx, "UPDATE ledger_entries SET amount = 9999 WHERE id = $1", debitID)
+	_, updateErr := adminPool.Exec(ctx, "UPDATE ledger_entries SET amount = 9999 WHERE id = $1", debitID)
 	if updateErr == nil {
 		t.Fatalf("expected error updating ledger entry, got nil")
 	}
@@ -1541,7 +1545,7 @@ func TestDatabaseTriggers_RejectLedgerMutation_UpdateAndDelete(t *testing.T) {
 	}
 
 	// 2. Direct DELETE on ledger_entries must be rejected by trg_prevent_ledger_mutation
-	_, deleteErr := pool.Exec(ctx, "DELETE FROM ledger_entries WHERE id = $1", creditID)
+	_, deleteErr := adminPool.Exec(ctx, "DELETE FROM ledger_entries WHERE id = $1", creditID)
 	if deleteErr == nil {
 		t.Fatalf("expected error deleting ledger entry, got nil")
 	}
@@ -1549,9 +1553,37 @@ func TestDatabaseTriggers_RejectLedgerMutation_UpdateAndDelete(t *testing.T) {
 		t.Fatalf("expected immutability trigger error, got: %v", deleteErr)
 	}
 
-	// 3. Verify ledger entries are still untouched
+	// 3. Direct TRUNCATE on ledger_entries must be rejected by trg_prevent_ledger_truncate
+	_, truncateErr := adminPool.Exec(ctx, "TRUNCATE TABLE ledger_entries;")
+	if truncateErr == nil {
+		t.Fatalf("expected error truncating ledger_entries, got nil")
+	}
+	if !strings.Contains(truncateErr.Error(), "ledger entries are immutable: deletions and updates are forbidden") {
+		t.Fatalf("expected truncate trigger error, got: %v", truncateErr)
+	}
+
+	runtimeURL := os.Getenv("TEST_DATABASE_URL")
+	if runtimeURL == "" {
+		runtimeURL = "postgres://wallet_app:wallet_app_password@localhost:5432/wallet_test_db?sslmode=disable"
+	}
+	runtimePool, err := postgres.NewPool(ctx, runtimeURL)
+	if err != nil {
+		t.Fatalf("failed to connect runtime pool: %v", err)
+	}
+	defer runtimePool.Close()
+
+	_, runtimeUpdateErr := runtimePool.Exec(ctx, "UPDATE ledger_entries SET amount = 9999 WHERE id = $1", debitID)
+	if runtimeUpdateErr == nil {
+		t.Fatalf("expected runtime role to fail update on ledger_entries, got nil")
+	}
+	_, runtimeTruncateErr := runtimePool.Exec(ctx, "TRUNCATE TABLE ledger_entries;")
+	if runtimeTruncateErr == nil {
+		t.Fatalf("expected runtime role to fail truncate on ledger_entries, got nil")
+	}
+
+	// 5. Verify ledger entries are still untouched
 	var count int
-	err = pool.QueryRow(ctx, "SELECT count(*) FROM ledger_entries WHERE transfer_id = $1", resp.TransferID).Scan(&count)
+	err = adminPool.QueryRow(ctx, "SELECT count(*) FROM ledger_entries WHERE transfer_id = $1", resp.TransferID).Scan(&count)
 	if err != nil || count != 2 {
 		t.Fatalf("expected 2 ledger entries, got count=%d, err=%v", count, err)
 	}
@@ -1767,7 +1799,16 @@ func TestDatabaseTriggers_ProcessedTransferWithoutLedgerPairFailsAtCommit(t *tes
 
 func TestLedgerRepository_DeterministicOrdering_TieBreaker(t *testing.T) {
 	ctx := context.Background()
-	_, walletSvc, repos := setupServicesWithRepos(t)
+	_, walletSvc, txManager, repos := setupServicesWithTxManager(t)
+
+	wSource, err := walletSvc.CreateWallet(ctx, service.CreateWalletRequest{
+		ID:             "w_order_src",
+		Name:           "Ordering Source Wallet",
+		InitialBalance: 1000,
+	})
+	if err != nil {
+		t.Fatalf("failed to create source wallet: %v", err)
+	}
 
 	w, err := walletSvc.CreateWallet(ctx, service.CreateWalletRequest{
 		ID:             "w_order_test",
@@ -1778,16 +1819,47 @@ func TestLedgerRepository_DeterministicOrdering_TieBreaker(t *testing.T) {
 		t.Fatalf("failed to create wallet: %v", err)
 	}
 
-	// Insert three opening ledger entries sharing the exact same timestamp with distinct IDs
 	fixedTime := time.Date(2026, 9, 12, 12, 0, 0, 0, time.UTC)
-	e1 := domain.LedgerEntry{ID: "c_entry", WalletID: w.ID, Type: domain.LedgerEntryTypeCredit, Amount: 10, CreatedAt: fixedTime}
-	e2 := domain.LedgerEntry{ID: "a_entry", WalletID: w.ID, Type: domain.LedgerEntryTypeCredit, Amount: 20, CreatedAt: fixedTime}
-	e3 := domain.LedgerEntry{ID: "b_entry", WalletID: w.ID, Type: domain.LedgerEntryTypeCredit, Amount: 30, CreatedAt: fixedTime}
-
-	for _, e := range []domain.LedgerEntry{e1, e2, e3} {
-		if err := repos.Ledger.CreateLedgerEntries(ctx, e); err != nil {
-			t.Fatalf("failed to insert entry %s: %v", e.ID, err)
+	err = txManager.ExecuteInTx(ctx, func(txRepos repository.Repositories) error {
+		txA := &domain.Transfer{ID: "tx_a", IdempotencyKey: "idem_a_" + uuid.NewString(), FromWalletID: wSource.ID, ToWalletID: w.ID, Amount: 20, Status: domain.TransferStatusProcessed}
+		if err := txRepos.Transfers.CreateTransfer(ctx, txA); err != nil {
+			return err
 		}
+		txB := &domain.Transfer{ID: "tx_b", IdempotencyKey: "idem_b_" + uuid.NewString(), FromWalletID: wSource.ID, ToWalletID: w.ID, Amount: 30, Status: domain.TransferStatusProcessed}
+		if err := txRepos.Transfers.CreateTransfer(ctx, txB); err != nil {
+			return err
+		}
+		txC := &domain.Transfer{ID: "tx_c", IdempotencyKey: "idem_c_" + uuid.NewString(), FromWalletID: wSource.ID, ToWalletID: w.ID, Amount: 10, Status: domain.TransferStatusProcessed}
+		if err := txRepos.Transfers.CreateTransfer(ctx, txC); err != nil {
+			return err
+		}
+
+		pairC := []domain.LedgerEntry{
+			{ID: "c_debit", TransferID: txC.ID, WalletID: wSource.ID, Type: domain.LedgerEntryTypeDebit, Amount: 10, CreatedAt: fixedTime},
+			{ID: "c_entry", TransferID: txC.ID, WalletID: w.ID, Type: domain.LedgerEntryTypeCredit, Amount: 10, CreatedAt: fixedTime},
+		}
+		pairA := []domain.LedgerEntry{
+			{ID: "a_debit", TransferID: txA.ID, WalletID: wSource.ID, Type: domain.LedgerEntryTypeDebit, Amount: 20, CreatedAt: fixedTime},
+			{ID: "a_entry", TransferID: txA.ID, WalletID: w.ID, Type: domain.LedgerEntryTypeCredit, Amount: 20, CreatedAt: fixedTime},
+		}
+		pairB := []domain.LedgerEntry{
+			{ID: "b_debit", TransferID: txB.ID, WalletID: wSource.ID, Type: domain.LedgerEntryTypeDebit, Amount: 30, CreatedAt: fixedTime},
+			{ID: "b_entry", TransferID: txB.ID, WalletID: w.ID, Type: domain.LedgerEntryTypeCredit, Amount: 30, CreatedAt: fixedTime},
+		}
+
+		if err := txRepos.Ledger.CreateLedgerEntries(ctx, pairC...); err != nil {
+			return err
+		}
+		if err := txRepos.Ledger.CreateLedgerEntries(ctx, pairA...); err != nil {
+			return err
+		}
+		if err := txRepos.Ledger.CreateLedgerEntries(ctx, pairB...); err != nil {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("failed to insert test data in transaction: %v", err)
 	}
 
 	entries, err := repos.Ledger.GetLedgerByWalletID(ctx, w.ID, 10, 0)
@@ -2774,8 +2846,27 @@ func TestDatabaseTriggers_RejectTerminalTransferStatusMutation(t *testing.T) {
 	if commitErr == nil {
 		t.Fatalf("expected commit to fail when mutating terminal transfer status to PENDING, but got nil")
 	}
-	if !strings.Contains(commitErr.Error(), "cannot update terminal transfer") {
-		t.Fatalf("expected error message to contain 'cannot update terminal transfer', got: %v", commitErr)
+	if !strings.Contains(commitErr.Error(), "is immutable and cannot be updated") {
+		t.Fatalf("expected error message to contain 'is immutable and cannot be updated', got: %v", commitErr)
+	}
+
+	// 3. Direct UPDATE on non-status fields (amount, failure_reason) of a terminal transfer must ALSO be rejected
+	amountTx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("failed to begin amount update tx: %v", err)
+	}
+	defer amountTx.Rollback(ctx)
+
+	_, err = amountTx.Exec(ctx, "UPDATE transfers SET amount = 99999 WHERE id = $1", txID)
+	if err != nil {
+		t.Fatalf("failed to execute amount update statement: %v", err)
+	}
+	amountCommitErr := amountTx.Commit(ctx)
+	if amountCommitErr == nil {
+		t.Fatalf("expected commit to fail when mutating amount on terminal transfer, but got nil")
+	}
+	if !strings.Contains(amountCommitErr.Error(), "is immutable and cannot be updated") {
+		t.Fatalf("expected error message to contain 'is immutable and cannot be updated', got: %v", amountCommitErr)
 	}
 }
 
@@ -2844,8 +2935,8 @@ func (r *trackingHeartbeatRepo) DeleteInProgress(ctx context.Context, key string
 	return r.realRepo.DeleteInProgress(ctx, key, ownerToken)
 }
 
-func (r *trackingHeartbeatRepo) DeleteIdempotency(ctx context.Context, key string) error {
-	return r.realRepo.DeleteIdempotency(ctx, key)
+func (r *trackingHeartbeatRepo) DeleteStaleInProgress(ctx context.Context, key string, ownerToken string, maxUpdatedAt time.Time) error {
+	return r.realRepo.DeleteStaleInProgress(ctx, key, ownerToken, maxUpdatedAt)
 }
 
 func TestTransferService_DedicatedHeartbeatRepo(t *testing.T) {
@@ -2967,4 +3058,3 @@ func TestIdempotencyRepo_UpdateIdempotency_AlwaysSetsCurrentTimestamp(t *testing
 		t.Fatalf("expected stored UpdatedAt (%v) to be after initial (%v)", stored.UpdatedAt, initialUpdatedAt)
 	}
 }
-

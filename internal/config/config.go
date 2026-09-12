@@ -15,12 +15,13 @@ var ErrMissingAdminKey = errors.New("ADMIN_KEY must be explicitly configured in 
 
 // Config holds runtime configuration settings.
 type Config struct {
-	Environment       string
-	Port              string
-	DatabaseURL       string
-	DatabaseMaxConns  int32
-	HeartbeatHeadroom int32
-	AdminKey          string
+	Environment          string
+	Port                 string
+	DatabaseURL          string
+	MigrationDatabaseURL string
+	DatabaseMaxConns     int32
+	HeartbeatHeadroom    int32
+	AdminKey             string
 }
 
 // Load reads configuration from environment variables.
@@ -71,13 +72,23 @@ func Load() (*Config, error) {
 	maxConns := int32(30)
 	headroom := int32(10)
 
+	migrationURL := os.Getenv("MIGRATION_DATABASE_URL")
+	if migrationURL == "" {
+		if !isNonDevelopment(env) {
+			migrationURL = "postgres://postgres:postgrespassword@localhost:5432/wallet_db?sslmode=disable"
+		} else {
+			migrationURL = dbURL
+		}
+	}
+
 	return &Config{
-		Environment:       env,
-		Port:              port,
-		DatabaseURL:       dbURL,
-		DatabaseMaxConns:  maxConns,
-		HeartbeatHeadroom: headroom,
-		AdminKey:          adminKey,
+		Environment:          env,
+		Port:                 port,
+		DatabaseURL:          dbURL,
+		MigrationDatabaseURL: migrationURL,
+		DatabaseMaxConns:     maxConns,
+		HeartbeatHeadroom:    headroom,
+		AdminKey:             adminKey,
 	}, nil
 }
 

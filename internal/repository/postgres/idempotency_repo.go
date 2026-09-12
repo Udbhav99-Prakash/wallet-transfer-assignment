@@ -205,14 +205,14 @@ func (r *idempotencyRepository) UpdateIdempotency(ctx context.Context, record *d
 	return nil
 }
 
-func (r *idempotencyRepository) DeleteIdempotency(ctx context.Context, key string) error {
+func (r *idempotencyRepository) DeleteStaleInProgress(ctx context.Context, key string, ownerToken string, maxUpdatedAt time.Time) error {
 	query := `
 		DELETE FROM idempotency_records
-		WHERE idempotency_key = $1 AND status = 'IN_PROGRESS'
+		WHERE idempotency_key = $1 AND owner_token = $2 AND status = 'IN_PROGRESS' AND updated_at <= $3
 	`
-	_, err := r.db.Exec(ctx, query, key)
+	_, err := r.db.Exec(ctx, query, key, ownerToken, maxUpdatedAt)
 	if err != nil {
-		return fmt.Errorf("failed to delete in-progress idempotency reservation: %w", err)
+		return fmt.Errorf("failed to delete stale in-progress idempotency reservation: %w", err)
 	}
 	return nil
 }

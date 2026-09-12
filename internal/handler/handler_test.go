@@ -815,3 +815,83 @@ func TestHandler_GetWalletLedger_Pagination(t *testing.T) {
 		t.Fatalf("expected 400 Bad Request for negative offset, got %d", badOffsetRec.Code)
 	}
 }
+
+func TestWalletHandler_FieldBoundsValidation_Returns400(t *testing.T) {
+	router := setupTestServer(t)
+
+	// 1. Overlong Name (> 255 chars)
+	longName := strings.Repeat("A", 256)
+	overlongNameBody, _ := json.Marshal(map[string]interface{}{
+		"id":             "w_valid_id",
+		"name":           longName,
+		"currency":       "USD",
+		"initialBalance": 100,
+	})
+	req1 := httptest.NewRequest(http.MethodPost, "/wallets", bytes.NewReader(overlongNameBody))
+	req1.Header.Set("Content-Type", "application/json")
+	req1.Header.Set("X-Admin-Key", testAdminKey)
+	rec1 := httptest.NewRecorder()
+	router.ServeHTTP(rec1, req1)
+	if rec1.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 Bad Request for overlong wallet name, got %d: %s", rec1.Code, rec1.Body.String())
+	}
+	if !strings.Contains(rec1.Body.String(), "wallet name must not exceed 255 characters") {
+		t.Fatalf("expected error message for overlong wallet name, got: %s", rec1.Body.String())
+	}
+
+	// 2. Overlong ID (> 64 chars)
+	longID := strings.Repeat("x", 65)
+	overlongIDBody, _ := json.Marshal(map[string]interface{}{
+		"id":             longID,
+		"name":           "Valid Name",
+		"currency":       "USD",
+		"initialBalance": 100,
+	})
+	req2 := httptest.NewRequest(http.MethodPost, "/wallets", bytes.NewReader(overlongIDBody))
+	req2.Header.Set("Content-Type", "application/json")
+	req2.Header.Set("X-Admin-Key", testAdminKey)
+	rec2 := httptest.NewRecorder()
+	router.ServeHTTP(rec2, req2)
+	if rec2.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 Bad Request for overlong wallet ID, got %d: %s", rec2.Code, rec2.Body.String())
+	}
+	if !strings.Contains(rec2.Body.String(), "wallet ID must not exceed 64 characters") {
+		t.Fatalf("expected error message for overlong wallet ID, got: %s", rec2.Body.String())
+	}
+
+	// 3. Invalid currency length (!= 3 chars)
+	for _, badCurrency := range []string{"US", "USDD", "1", "EUROPE"} {
+		badCurrBody, _ := json.Marshal(map[string]interface{}{
+			"id":             "w_curr_" + badCurrency,
+			"name":           "Valid Name",
+			"currency":       badCurrency,
+			"initialBalance": 100,
+		})
+		req3 := httptest.NewRequest(http.MethodPost, "/wallets", bytes.NewReader(badCurrBody))
+		req3.Header.Set("Content-Type", "application/json")
+		req3.Header.Set("X-Admin-Key", testAdminKey)
+		rec3 := httptest.NewRecorder()
+		router.ServeHTTP(rec3, req3)
+		if rec3.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400 Bad Request for invalid currency %q, got %d: %s", badCurrency, rec3.Code, rec3.Body.String())
+		}
+		if !strings.Contains(rec3.Body.String(), "currency must be a valid 3-letter code") {
+			t.Fatalf("expected error message for invalid currency %q, got: %s", badCurrency, rec3.Body.String())
+		}
+	}
+
+	// 4. Also verify admin wallet creation endpoint (/admin/wallets) enforces bounds and returns 400
+	adminLongNameBody, _ := json.Marshal(map[string]interface{}{
+		"name":           longName,
+		"currency":       "USD",
+		"initialBalance": 100,
+	})
+	adminReq := httptest.NewRequest(http.MethodPost, "/admin/wallets", bytes.NewReader(adminLongNameBody))
+	adminReq.Header.Set("Content-Type", "application/json")
+	adminReq.Header.Set("X-Admin-Key", testAdminKey)
+	adminRec := httptest.NewRecorder()
+	router.ServeHTTP(adminRec, adminReq)
+	if adminRec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 Bad Request for admin wallet overlong name, got %d: %s", adminRec.Code, adminRec.Body.String())
+	}
+}
