@@ -48,7 +48,7 @@ Antigravity was employed as an active **pair programmer and systems design sound
 
 ## 3. Session Transcript & Prompt Records
 
-The complete transcript of all 54 interaction turns—including exact prompt text, tool invocations, and AI responses—is preserved in this repository:
+The complete transcript of all 56 interaction turns—including exact prompt text, tool invocations, and AI responses—is preserved in this repository:
 - **Readable Session Transcript**: [`AI_TRANSCRIPT.md`](./AI_TRANSCRIPT.md)
 - **Raw Agent Interaction Log**: Persisted in the session metadata logs.
 
@@ -56,7 +56,7 @@ The complete transcript of all 54 interaction turns—including exact prompt tex
 
 ## 4. Chronological List of All Prompts
 
-Below is the complete chronological log of all 54 explicit prompts provided during the development session:
+Below is the complete chronological log of all 56 explicit prompts provided during the development session:
 
 | # | Timestamp (UTC) | Phase | User Prompt |
 |---|---|---|---|
@@ -114,6 +114,8 @@ Below is the complete chronological log of all 54 explicit prompts provided duri
 | **52** | `2026-09-11 22:35:10` | Review Fixes | *[Follow-up Review Feedback on PR #169 covering atomic multi-row ledger inserts, in-flight heartbeat lease cancellation, strict migration version lookup error handling, migration runner advisory locks, transfers table constraint triggers, and ledger immutability triggers]* |
 | **53** | `2026-09-11 22:41:41` | Git & Commit | *push the changes* |
 | **54** | `2026-09-12 06:42:19` | Review Fixes | *internal/handler/wallet_handler.go:35 When a requested initial balance exceeds the system treasury, WalletService.CreateWallet returns ErrInsufficientFunds, but this switch falls through to the generic 500 response. That is a normal business rejection rather than an internal failure; map it to a client/business status (for example 422, as the transfer handler does) so callers receive a retryable, actionable result.* |
+| **55** | `2026-09-12 06:46:27` | Review Fixes | *[Follow-up Review Feedback on PR #169 covering deterministic ledger ordering tie-breaker, heartbeat join before commit decision, txCtx propagation to transaction callbacks, atomic preflight idempotency rechecks, and commit-ambiguity preservation]* |
+| **56** | `2026-09-12 06:54:34` | Review Fixes | *In [internal/service/transfer_service.go]: All heartbeat errors other than ErrIdempotencyLeaseLost are silently ignored... Track the heartbeat failure and cancel or otherwise fail the lease when refreshes cannot be completed reliably. resolve this also then push* |
 
 ---
 
@@ -124,7 +126,11 @@ The author is fully prepared to explain and defend every design decision and lin
 1. **Short-Committed Reservation Protocol & Owner-Token Lease Fencing**:
    - Why we insert `IN_PROGRESS` in an immediate short transaction rather than keeping an uncommitted lock open during the entire transfer: under burst retries, overlapping requests immediately receive `409 Conflict` without tying up database connection pool workers.
    - Stale-owner recovery & fencing: if a worker process crashes while holding an `IN_PROGRESS` reservation, reservations older than 30 seconds are reclaimed safely. To prevent slow/paused workers from corrupting or deleting state after a lease reclaim, every reservation and reclaim generates an `owner_token`. Updates and deferred cleanups are fenced by `owner_token`.
-   - Lease Heartbeats & Active In-Flight Cancellation: while a transfer is actively running, a background heartbeat periodically refreshes `updated_at` every 5 seconds so live requests are never reclaimed prematurely. If heartbeat encounters `ErrIdempotencyLeaseLost`, it actively cancels the in-flight context (`cancelTx()`), instantly releasing row locks to prevent duplicate work or contention with the replacement owner.
+   - Lease Heartbeats & Active In-Flight Cancellation: while a transfer is actively running, a background heartbeat periodically refreshes `updated_at` every 5 seconds so live requests are never reclaimed prematurely. If heartbeat encounters `ErrIdempotencyLeaseLost`, it actively cancels the in-flight context (`cancelTx()`), instantly releasing row locks to prevent duplicate work or contention with the replacement owner. All database operations in the transaction callback strictly receive `txCtx` so cancellation takes effect immediately.
+   - Unrefreshable Heartbeat Tracking: non-lease-loss heartbeat failures (e.g. database timeouts, dropped connections) are tracked across consecutive failures and elapsed time; if refreshes cannot be completed reliably before the 30-second reclaim timeout, `cancelTx()` aborts the transaction immediately to prevent holding locks with an unrefreshed lease.
+   - Heartbeat Stop/Join & Authoritative Commit: the service stops and joins the heartbeat before checking lease status; if the transaction committed, the commit is authoritative, eliminating races where post-commit ticker ticks report false lease loss.
+   - Commit-Ambiguity Preservation: if a transaction completed its operations but commit reports an ambiguous failure (e.g. dropped connection during ACK), the `IN_PROGRESS` reservation is preserved and reconciled rather than blindly deleted, preventing double debits on client retries.
+   - Preflight Idempotency Recheck: if preflight validation fails, the key is rechecked against `idempotency_records` so concurrent key reuses receive `409 Conflict/In-Progress` with the exact same precedence as sequential reuses.
 2. **Deterministic Deadlock Prevention**:
    - Why locking ordering is sorted lexicographically (`from_id < to_id ? (from, to) : (to, from)`): breaks the circular wait condition (Coffman condition) across concurrent bidirectional transfers.
    - Initial wallet funding locks `system_treasury` before inserting the user wallet to adhere strictly to the global lock hierarchy.
@@ -133,6 +139,7 @@ The author is fully prepared to explain and defend every design decision and lin
    - Multi-row atomic SQL inserts (`INSERT INTO ledger_entries (...) VALUES (...), (...)`) guarantee statement-level atomicity even when invoked against connection pools without an explicit outer transaction.
    - Database-level composite unique indexes (`(transfer_id, type)` and `(transfer_id, wallet_id)`), together with commit-deferred PostgreSQL constraint triggers (`trg_check_ledger_pair` on `ledger_entries` and `trg_check_transfer_processed` on `transfers`), guarantee that no transfer can commit with status `PROCESSED` without exactly one matching DEBIT on `from_wallet_id` and one CREDIT on `to_wallet_id` equal to the transfer amount.
    - Immutability trigger (`trg_prevent_ledger_mutation`) strictly forbids any `UPDATE` or `DELETE` on `ledger_entries`, preserving the immutable financial audit log.
+   - Deterministic Ledger Pagination: `GetLedgerByWalletID` orders by `created_at ASC, id ASC`, using the primary key `id` as a unique tie-breaker to prevent nondeterministic history ordering across identical timestamps.
    - `ReconcileBalance` performs `SELECT ... FOR UPDATE` row locking on the wallet inside a transaction while aggregating ledger records, eliminating false concurrency mismatches.
 4. **Length-Delimited Preimage Hashing**:
    - Why `%d:%s:%d:%s:%d` prevents delimiter injection attacks across colon characters.

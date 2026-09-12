@@ -1321,3 +1321,211 @@ func TestLedgerRepository_EnforcesBalancedPair(t *testing.T) {
 		t.Fatalf("expected ErrInvalidLedgerPair for unbalanced amounts, got %v", err)
 	}
 }
+
+func TestLedgerRepository_DeterministicOrdering_TieBreaker(t *testing.T) {
+	ctx := context.Background()
+	_, walletSvc, repos := setupServicesWithRepos(t)
+
+	w, err := walletSvc.CreateWallet(ctx, service.CreateWalletRequest{
+		ID:             "w_order_test",
+		Name:           "Ordering Test Wallet",
+		InitialBalance: 0,
+	})
+	if err != nil {
+		t.Fatalf("failed to create wallet: %v", err)
+	}
+
+	// Insert three opening ledger entries sharing the exact same timestamp with distinct IDs
+	fixedTime := time.Date(2026, 9, 12, 12, 0, 0, 0, time.UTC)
+	e1 := domain.LedgerEntry{ID: "c_entry", WalletID: w.ID, Type: domain.LedgerEntryTypeCredit, Amount: 10, CreatedAt: fixedTime}
+	e2 := domain.LedgerEntry{ID: "a_entry", WalletID: w.ID, Type: domain.LedgerEntryTypeCredit, Amount: 20, CreatedAt: fixedTime}
+	e3 := domain.LedgerEntry{ID: "b_entry", WalletID: w.ID, Type: domain.LedgerEntryTypeCredit, Amount: 30, CreatedAt: fixedTime}
+
+	for _, e := range []domain.LedgerEntry{e1, e2, e3} {
+		if err := repos.Ledger.CreateLedgerEntries(ctx, e); err != nil {
+			t.Fatalf("failed to insert entry %s: %v", e.ID, err)
+		}
+	}
+
+	entries, err := repos.Ledger.GetLedgerByWalletID(ctx, w.ID)
+	if err != nil {
+		t.Fatalf("failed to get ledger: %v", err)
+	}
+
+	// Expect deterministic ascending order by ID: a_entry, b_entry, c_entry
+	if len(entries) != 3 {
+		t.Fatalf("expected 3 entries, got %d", len(entries))
+	}
+	if entries[0].ID != "a_entry" || entries[1].ID != "b_entry" || entries[2].ID != "c_entry" {
+		t.Fatalf("expected deterministic ID tie-breaking [a_entry, b_entry, c_entry], got [%s, %s, %s]",
+			entries[0].ID, entries[1].ID, entries[2].ID)
+	}
+}
+
+func TestTransferService_PreflightRecheck_ConcurrentIdempotency(t *testing.T) {
+	ctx := context.Background()
+	transferSvc, walletSvc, repos := setupServicesWithRepos(t)
+
+	w1, _ := walletSvc.CreateWallet(ctx, service.CreateWalletRequest{
+		ID:             "w_prerecheck_1",
+		Name:           "Sender",
+		InitialBalance: 1000,
+	})
+	w2, _ := walletSvc.CreateWallet(ctx, service.CreateWalletRequest{
+		ID:             "w_prerecheck_2",
+		Name:           "Receiver",
+		InitialBalance: 0,
+	})
+
+	// Simulate a concurrent request that already reserved the key
+	key := "concurrent_preflight_key"
+	_, _, err := repos.Idempotency.ReserveIdempotency(ctx, &domain.IdempotencyRecord{
+		IdempotencyKey: key,
+		RequestHash:    domain.ComputeRequestHash(w1.ID, w2.ID, 100),
+		OwnerToken:     "other_owner",
+		Status:         domain.IdempotencyStatusInProgress,
+	}, 30*time.Second)
+	if err != nil {
+		t.Fatalf("failed to seed concurrent reservation: %v", err)
+	}
+
+	// Attempt a transfer with the same key but INVALID amount (-50)
+	// Must return ErrIdempotencyConflict, NOT ErrInvalidAmount
+	_, err = transferSvc.ExecuteTransfer(ctx, service.CreateTransferRequest{
+		IdempotencyKey: key,
+		FromWalletID:   w1.ID,
+		ToWalletID:     w2.ID,
+		Amount:         -50,
+	})
+	if !errors.Is(err, domain.ErrIdempotencyConflict) {
+		t.Fatalf("expected ErrIdempotencyConflict for concurrent key with invalid amount, got %v", err)
+	}
+
+	// Attempt a transfer with the same key and same parameters (which would otherwise succeed)
+	// Must return ErrIdempotencyInProgress (409), not proceed with execution
+	_, err = transferSvc.ExecuteTransfer(ctx, service.CreateTransferRequest{
+		IdempotencyKey: key,
+		FromWalletID:   w1.ID,
+		ToWalletID:     w2.ID,
+		Amount:         100,
+	})
+	if !errors.Is(err, domain.ErrIdempotencyInProgress) {
+		t.Fatalf("expected ErrIdempotencyInProgress for active concurrent reservation, got %v", err)
+	}
+}
+
+type failingCommitTxManager struct {
+	realTxManager repository.TxManager
+}
+
+func (m *failingCommitTxManager) ExecuteInTx(ctx context.Context, fn func(txRepos repository.Repositories) error) error {
+	_ = m.realTxManager.ExecuteInTx(ctx, func(txRepos repository.Repositories) error {
+		return fn(txRepos)
+	})
+	// Simulate commit returning an error after operations completed
+	return errors.New("simulated ambiguous commit failure: commit ACK dropped")
+}
+
+func TestTransferService_CommitAmbiguity_PreservesReservation(t *testing.T) {
+	ctx := context.Background()
+	_, walletSvc, txManager, repos := setupServicesWithTxManager(t)
+
+	w1, _ := walletSvc.CreateWallet(ctx, service.CreateWalletRequest{
+		ID:             "w_ambig_1",
+		Name:           "Sender",
+		InitialBalance: 1000,
+	})
+	w2, _ := walletSvc.CreateWallet(ctx, service.CreateWalletRequest{
+		ID:             "w_ambig_2",
+		Name:           "Receiver",
+		InitialBalance: 0,
+	})
+
+	failingTxManager := &failingCommitTxManager{realTxManager: txManager}
+	transferSvc := service.NewTransferService(failingTxManager, repos)
+
+	key := "ambiguous_commit_key"
+	resp, err := transferSvc.ExecuteTransfer(ctx, service.CreateTransferRequest{
+		IdempotencyKey: key,
+		FromWalletID:   w1.ID,
+		ToWalletID:     w2.ID,
+		Amount:         100,
+	})
+	// Because the transaction actually committed in the real DB before the simulated ACK failure,
+	// ExecuteTransfer must reconcile the committed outcome and return the successful response
+	if err != nil {
+		t.Fatalf("expected successful reconciliation of committed transfer, got error: %v", err)
+	}
+	if resp == nil || resp.Status != domain.TransferStatusProcessed {
+		t.Fatalf("expected PROCESSED response from reconciliation, got %+v", resp)
+	}
+
+	// The reservation must NOT be deleted blindly by deferred cleanup; it must be COMPLETED
+	rec, getErr := repos.Idempotency.GetIdempotency(ctx, key)
+	if getErr != nil {
+		t.Fatalf("failed to query idempotency: %v", getErr)
+	}
+	if rec == nil {
+		t.Fatalf("reservation was unexpectedly deleted on ambiguous commit")
+	}
+	if rec.Status != domain.IdempotencyStatusCompleted {
+		t.Fatalf("expected reconciled status COMPLETED, got %s", rec.Status)
+	}
+}
+
+type failingHeartbeatIdempotencyRepo struct {
+	repository.IdempotencyRepository
+}
+
+func (f *failingHeartbeatIdempotencyRepo) HeartbeatIdempotency(ctx context.Context, key string, ownerToken string) error {
+	return errors.New("simulated network failure during heartbeat lease refresh")
+}
+
+type delayTxManager struct {
+	realTxManager repository.TxManager
+	delay         time.Duration
+}
+
+func (m *delayTxManager) ExecuteInTx(ctx context.Context, fn func(txRepos repository.Repositories) error) error {
+	return m.realTxManager.ExecuteInTx(ctx, func(txRepos repository.Repositories) error {
+		time.Sleep(m.delay)
+		return fn(txRepos)
+	})
+}
+
+func TestTransferService_HeartbeatFailure_AbortsTransaction(t *testing.T) {
+	ctx := context.Background()
+	_, walletSvc, txManager, repos := setupServicesWithTxManager(t)
+
+	w1, _ := walletSvc.CreateWallet(ctx, service.CreateWalletRequest{
+		ID:             "w_hbfail_1",
+		Name:           "Sender",
+		InitialBalance: 1000,
+	})
+	w2, _ := walletSvc.CreateWallet(ctx, service.CreateWalletRequest{
+		ID:             "w_hbfail_2",
+		Name:           "Receiver",
+		InitialBalance: 0,
+	})
+
+	repos.Idempotency = &failingHeartbeatIdempotencyRepo{IdempotencyRepository: repos.Idempotency}
+	slowTxManager := &delayTxManager{realTxManager: txManager, delay: 50 * time.Millisecond}
+
+	transferSvc := service.NewTransferService(slowTxManager, repos)
+	transferSvc.SetHeartbeatInterval(10 * time.Millisecond)
+	transferSvc.SetStaleTimeout(40 * time.Millisecond)
+
+	key := "heartbeat_failure_abort_key"
+	_, err := transferSvc.ExecuteTransfer(ctx, service.CreateTransferRequest{
+		IdempotencyKey: key,
+		FromWalletID:   w1.ID,
+		ToWalletID:     w2.ID,
+		Amount:         100,
+	})
+	if err == nil {
+		t.Fatalf("expected error from unrefreshable heartbeat failure, got nil")
+	}
+	if !strings.Contains(err.Error(), "heartbeat lease refresh failed reliably") {
+		t.Fatalf("expected error containing 'heartbeat lease refresh failed reliably', got: %v", err)
+	}
+}

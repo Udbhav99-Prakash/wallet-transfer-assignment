@@ -18,23 +18,30 @@ import (
 
 // TransferService provides transactional wallet transfer operations.
 type TransferService struct {
-	txManager    repository.TxManager
-	repos        repository.Repositories
-	staleTimeout time.Duration
+	txManager         repository.TxManager
+	repos             repository.Repositories
+	staleTimeout      time.Duration
+	heartbeatInterval time.Duration
 }
 
 // NewTransferService constructs a TransferService.
 func NewTransferService(txManager repository.TxManager, repos repository.Repositories) *TransferService {
 	return &TransferService{
-		txManager:    txManager,
-		repos:        repos,
-		staleTimeout: 30 * time.Second,
+		txManager:         txManager,
+		repos:             repos,
+		staleTimeout:      30 * time.Second,
+		heartbeatInterval: 5 * time.Second,
 	}
 }
 
 // SetStaleTimeout overrides the default stale reservation timeout (useful for testing).
 func (s *TransferService) SetStaleTimeout(d time.Duration) {
 	s.staleTimeout = d
+}
+
+// SetHeartbeatInterval overrides the default heartbeat interval (useful for testing).
+func (s *TransferService) SetHeartbeatInterval(d time.Duration) {
+	s.heartbeatInterval = d
 }
 
 // ExecuteTransfer orchestrates a safe, idempotent, double-entry wallet transfer.
@@ -83,20 +90,10 @@ func (s *TransferService) ExecuteTransfer(ctx context.Context, req CreateTransfe
 		}
 	}
 
-	// 3. Business-field validation (for new keys or stale lock reclaims)
-	if req.FromWalletID == "" || req.ToWalletID == "" {
-		return nil, domain.ErrMissingWalletID
-	}
-	if req.FromWalletID == req.ToWalletID {
-		return nil, domain.ErrSameWalletTransfer
-	}
-	if req.Amount <= 0 {
-		return nil, domain.ErrInvalidAmount
-	}
-
-	// Validate wallet existence, currency compatibility, and overflow before reserving idempotency key.
-	// This ensures invalid requests fail fast without reserving or polluting idempotency records.
-	// If an existing reservation was stale, remove it when preflight validation fails so it does not stay permanently stuck.
+	// Helper to recheck the idempotency key if preflight validation fails.
+	// A concurrent request might have reserved or completed the key in the gap between GetIdempotency
+	// and preflight validation. Rechecking guarantees concurrent reuses receive 409 Conflict/In-Progress
+	// with the exact same precedence as sequential reuses.
 	cleanupStaleReservation := func() {
 		if existing != nil && existing.Status == domain.IdempotencyStatusInProgress {
 			cleanupCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -105,29 +102,60 @@ func (s *TransferService) ExecuteTransfer(ctx context.Context, req CreateTransfe
 		}
 	}
 
+	checkValidationErr := func(validationErr error) error {
+		cleanupStaleReservation()
+		recheck, rErr := s.repos.Idempotency.GetIdempotency(ctx, req.IdempotencyKey)
+		if rErr == nil && recheck != nil {
+			if recheck.RequestHash != requestHash {
+				return domain.ErrIdempotencyConflict
+			}
+			if recheck.Status == domain.IdempotencyStatusInProgress {
+				staleTimeout := s.staleTimeout
+				if staleTimeout <= 0 {
+					staleTimeout = 30 * time.Second
+				}
+				if time.Since(recheck.UpdatedAt) <= staleTimeout {
+					return domain.ErrIdempotencyInProgress
+				}
+			}
+			// If already completed or failed, return conflict since this request failed validation
+			return domain.ErrIdempotencyConflict
+		}
+		return validationErr
+	}
+
+	// 3. Business-field validation (for new keys or stale lock reclaims)
+	if req.FromWalletID == "" || req.ToWalletID == "" {
+		return nil, checkValidationErr(domain.ErrMissingWalletID)
+	}
+	if req.FromWalletID == req.ToWalletID {
+		return nil, checkValidationErr(domain.ErrSameWalletTransfer)
+	}
+	if req.Amount <= 0 {
+		return nil, checkValidationErr(domain.ErrInvalidAmount)
+	}
+
+	// Validate wallet existence, currency compatibility, and overflow before reserving idempotency key.
+	// This ensures invalid requests fail fast without reserving or polluting idempotency records.
 	fromWalletPre, err := s.repos.Wallets.GetWalletByID(ctx, req.FromWalletID)
 	if err != nil {
 		if errors.Is(err, domain.ErrWalletNotFound) || errors.Is(err, pgx.ErrNoRows) {
-			cleanupStaleReservation()
-			return nil, domain.ErrWalletNotFound
+			return nil, checkValidationErr(domain.ErrWalletNotFound)
 		}
 		return nil, fmt.Errorf("failed to verify source wallet: %w", err)
 	}
 	toWalletPre, err := s.repos.Wallets.GetWalletByID(ctx, req.ToWalletID)
 	if err != nil {
 		if errors.Is(err, domain.ErrWalletNotFound) || errors.Is(err, pgx.ErrNoRows) {
-			cleanupStaleReservation()
-			return nil, domain.ErrWalletNotFound
+			return nil, checkValidationErr(domain.ErrWalletNotFound)
 		}
 		return nil, fmt.Errorf("failed to verify destination wallet: %w", err)
 	}
 	if fromWalletPre.Currency != toWalletPre.Currency {
-		cleanupStaleReservation()
-		return nil, domain.ErrCurrencyMismatch
+		return nil, checkValidationErr(domain.ErrCurrencyMismatch)
 	}
 	if !toWalletPre.CanCredit(req.Amount) {
-		cleanupStaleReservation()
-		return nil, domain.ErrBalanceOverflow
+		return nil, checkValidationErr(domain.ErrBalanceOverflow)
 	}
 
 	// 4. Short committed reservation outside the transfer transaction.
@@ -185,10 +213,31 @@ func (s *TransferService) ExecuteTransfer(ctx context.Context, req CreateTransfe
 	// This prevents a live but slow transaction from being reclaimed prematurely by stale-owner recovery.
 	stopHeartbeat := make(chan struct{})
 	heartbeatDone := make(chan struct{})
+	var stopHeartbeatOnce sync.Once
+	stopAndJoinHeartbeat := func() {
+		stopHeartbeatOnce.Do(func() {
+			close(stopHeartbeat)
+			<-heartbeatDone
+		})
+	}
+	defer stopAndJoinHeartbeat()
+
 	go func() {
 		defer close(heartbeatDone)
-		ticker := time.NewTicker(5 * time.Second)
+		interval := s.heartbeatInterval
+		if interval <= 0 {
+			interval = 5 * time.Second
+		}
+		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
+
+		lastHeartbeatSuccess := time.Now()
+		consecutiveFailures := 0
+		maxUnrefreshedDuration := staleTimeout / 2
+		if maxUnrefreshedDuration < 2*interval {
+			maxUnrefreshedDuration = 2 * interval
+		}
+
 		for {
 			select {
 			case <-stopHeartbeat:
@@ -196,10 +245,23 @@ func (s *TransferService) ExecuteTransfer(ctx context.Context, req CreateTransfe
 			case <-txCtx.Done():
 				return
 			case <-ticker.C:
-				hbCtx, hbCancel := context.WithTimeout(context.Background(), 3*time.Second)
+				hbTimeout := interval / 2
+				if hbTimeout < time.Second {
+					hbTimeout = 3 * time.Second
+				}
+				hbCtx, hbCancel := context.WithTimeout(context.Background(), hbTimeout)
 				hbErr := s.repos.Idempotency.HeartbeatIdempotency(hbCtx, req.IdempotencyKey, ownerToken)
 				hbCancel()
 				if hbErr != nil {
+					// Discard heartbeat error if heartbeat was already signaled to stop (e.g. after commit)
+					select {
+					case <-stopHeartbeat:
+						return
+					default:
+					}
+
+					consecutiveFailures++
+
 					if errors.Is(hbErr, domain.ErrIdempotencyLeaseLost) {
 						leaseMu.Lock()
 						leaseLostErr = domain.ErrIdempotencyLeaseLost
@@ -207,21 +269,39 @@ func (s *TransferService) ExecuteTransfer(ctx context.Context, req CreateTransfe
 						cancelTx() // Abort in-flight transaction immediately to release wallet locks
 						return
 					}
+
+					// Track non-lease-loss heartbeat failures (e.g. DB connection dropped, timeout).
+					// If refreshes cannot be completed reliably before the 30s stale window expires,
+					// abort the transaction to prevent holding locks with an unrefreshed, reclaimable lease.
+					if time.Since(lastHeartbeatSuccess) >= maxUnrefreshedDuration || consecutiveFailures >= 2 {
+						leaseMu.Lock()
+						leaseLostErr = fmt.Errorf("heartbeat lease refresh failed reliably: %w", hbErr)
+						leaseMu.Unlock()
+						cancelTx() // Abort in-flight transaction immediately
+						return
+					}
+				} else {
+					lastHeartbeatSuccess = time.Now()
+					consecutiveFailures = 0
 				}
 			}
 		}
 	}()
-	defer func() {
-		close(stopHeartbeat)
-		<-heartbeatDone
-	}()
+
+	var transferID string
+	var respBytes []byte
+	var txCompleted bool
+	var finalResponse *TransferResponse
+	var isInsufficientFunds bool
 
 	// The caller owns the reservation.
-	// If the transfer execution aborts unexpectedly (e.g. context cancellation, DB connection drop, panic),
+	// If the transfer execution aborts unexpectedly prior to commit (e.g. pre-commit failure, context cancellation, DB drop),
 	// delete the in-progress reservation so subsequent retries do not have to wait for stale timeout.
+	// However, if the transaction completed its operations and failed only at commit (ambiguous commit),
+	// do NOT delete the reservation, as PostgreSQL may have committed the transfer.
 	success := false
 	defer func() {
-		if !success {
+		if !success && !txCompleted {
 			cleanupCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 			defer cancel()
 			_ = s.repos.Idempotency.DeleteInProgress(cleanupCtx, req.IdempotencyKey, ownerToken)
@@ -229,9 +309,6 @@ func (s *TransferService) ExecuteTransfer(ctx context.Context, req CreateTransfe
 	}()
 
 	// 5. Execute transfer inside transaction
-	var finalResponse *TransferResponse
-	var isInsufficientFunds bool
-
 	txErr := s.txManager.ExecuteInTx(txCtx, func(txRepos repository.Repositories) error {
 		// Deterministic lock ordering to prevent deadlocks:
 		// Always acquire locks in alphabetical order: min(fromID, toID) followed by max(fromID, toID)
@@ -240,14 +317,14 @@ func (s *TransferService) ExecuteTransfer(ctx context.Context, req CreateTransfe
 			firstID, secondID = secondID, firstID
 		}
 
-		wallet1, lockErr1 := txRepos.Wallets.GetWalletByIDForUpdate(ctx, firstID)
+		wallet1, lockErr1 := txRepos.Wallets.GetWalletByIDForUpdate(txCtx, firstID)
 		if lockErr1 != nil {
 			if errors.Is(lockErr1, domain.ErrWalletNotFound) || errors.Is(lockErr1, pgx.ErrNoRows) {
 				return domain.ErrWalletNotFound
 			}
 			return lockErr1
 		}
-		wallet2, lockErr2 := txRepos.Wallets.GetWalletByIDForUpdate(ctx, secondID)
+		wallet2, lockErr2 := txRepos.Wallets.GetWalletByIDForUpdate(txCtx, secondID)
 		if lockErr2 != nil {
 			if errors.Is(lockErr2, domain.ErrWalletNotFound) || errors.Is(lockErr2, pgx.ErrNoRows) {
 				return domain.ErrWalletNotFound
@@ -273,7 +350,7 @@ func (s *TransferService) ExecuteTransfer(ctx context.Context, req CreateTransfe
 		}
 
 		// Initialize transfer record with PENDING state
-		transferID := uuid.NewString()
+		transferID = uuid.NewString()
 		transfer := &domain.Transfer{
 			ID:             transferID,
 			IdempotencyKey: req.IdempotencyKey,
@@ -282,7 +359,7 @@ func (s *TransferService) ExecuteTransfer(ctx context.Context, req CreateTransfe
 			Amount:         req.Amount,
 			Status:         domain.TransferStatusPending,
 		}
-		if createErr := txRepos.Transfers.CreateTransfer(ctx, transfer); createErr != nil {
+		if createErr := txRepos.Transfers.CreateTransfer(txCtx, transfer); createErr != nil {
 			return createErr
 		}
 
@@ -292,7 +369,7 @@ func (s *TransferService) ExecuteTransfer(ctx context.Context, req CreateTransfe
 			if markErr := transfer.MarkFailed(reason); markErr != nil {
 				return markErr
 			}
-			if updateErr := txRepos.Transfers.UpdateTransferStatus(ctx, transfer.ID, domain.TransferStatusFailed, &reason); updateErr != nil {
+			if updateErr := txRepos.Transfers.UpdateTransferStatus(txCtx, transfer.ID, domain.TransferStatusFailed, &reason); updateErr != nil {
 				return updateErr
 			}
 
@@ -307,7 +384,8 @@ func (s *TransferService) ExecuteTransfer(ctx context.Context, req CreateTransfe
 				CreatedAt:      transfer.CreatedAt,
 				ResponseCode:   http.StatusUnprocessableEntity,
 			}
-			respBytes, jsonErr := json.Marshal(resp)
+			var jsonErr error
+			respBytes, jsonErr = json.Marshal(resp)
 			if jsonErr != nil {
 				return fmt.Errorf("failed to marshal failure response: %w", jsonErr)
 			}
@@ -317,12 +395,13 @@ func (s *TransferService) ExecuteTransfer(ctx context.Context, req CreateTransfe
 			record.ResponseCode = http.StatusUnprocessableEntity
 			record.ResponseBody = string(respBytes)
 			record.OwnerToken = ownerToken
-			if updateErr := txRepos.Idempotency.UpdateIdempotency(ctx, record); updateErr != nil {
+			if updateErr := txRepos.Idempotency.UpdateIdempotency(txCtx, record); updateErr != nil {
 				return updateErr
 			}
 
 			finalResponse = resp
 			isInsufficientFunds = true
+			txCompleted = true
 			// Return nil so the transaction commits the FAILED transfer record and idempotency record
 			return nil
 		}
@@ -335,10 +414,10 @@ func (s *TransferService) ExecuteTransfer(ctx context.Context, req CreateTransfe
 			return creditErr
 		}
 
-		if updateErr := txRepos.Wallets.UpdateWalletBalance(ctx, fromWallet.ID, fromWallet.Balance); updateErr != nil {
+		if updateErr := txRepos.Wallets.UpdateWalletBalance(txCtx, fromWallet.ID, fromWallet.Balance); updateErr != nil {
 			return updateErr
 		}
-		if updateErr := txRepos.Wallets.UpdateWalletBalance(ctx, toWallet.ID, toWallet.Balance); updateErr != nil {
+		if updateErr := txRepos.Wallets.UpdateWalletBalance(txCtx, toWallet.ID, toWallet.Balance); updateErr != nil {
 			return updateErr
 		}
 
@@ -347,7 +426,7 @@ func (s *TransferService) ExecuteTransfer(ctx context.Context, req CreateTransfe
 		if ledgerErr != nil {
 			return ledgerErr
 		}
-		if err := txRepos.Ledger.CreateLedgerEntries(ctx, debitEntry, creditEntry); err != nil {
+		if err := txRepos.Ledger.CreateLedgerEntries(txCtx, debitEntry, creditEntry); err != nil {
 			return err
 		}
 
@@ -355,7 +434,7 @@ func (s *TransferService) ExecuteTransfer(ctx context.Context, req CreateTransfe
 		if markErr := transfer.MarkProcessed(); markErr != nil {
 			return markErr
 		}
-		if err := txRepos.Transfers.UpdateTransferStatus(ctx, transfer.ID, domain.TransferStatusProcessed, nil); err != nil {
+		if err := txRepos.Transfers.UpdateTransferStatus(txCtx, transfer.ID, domain.TransferStatusProcessed, nil); err != nil {
 			return err
 		}
 
@@ -370,7 +449,8 @@ func (s *TransferService) ExecuteTransfer(ctx context.Context, req CreateTransfe
 			CreatedAt:      transfer.CreatedAt,
 			ResponseCode:   http.StatusCreated,
 		}
-		respBytes, jsonErr := json.Marshal(resp)
+		var jsonErr error
+		respBytes, jsonErr = json.Marshal(resp)
 		if jsonErr != nil {
 			return fmt.Errorf("failed to marshal transfer response: %w", jsonErr)
 		}
@@ -380,33 +460,77 @@ func (s *TransferService) ExecuteTransfer(ctx context.Context, req CreateTransfe
 		record.ResponseCode = http.StatusCreated
 		record.ResponseBody = string(respBytes)
 		record.OwnerToken = ownerToken
-		if updateErr := txRepos.Idempotency.UpdateIdempotency(ctx, record); updateErr != nil {
+		if updateErr := txRepos.Idempotency.UpdateIdempotency(txCtx, record); updateErr != nil {
 			return updateErr
 		}
 
 		finalResponse = resp
+		txCompleted = true
 		return nil
 	})
 
+	// Stop and join the heartbeat before inspecting lease status or deciding the result.
+	stopAndJoinHeartbeat()
+
+	// If transaction successfully committed, treat successful commit as authoritative!
+	if txErr == nil {
+		success = true
+		if isInsufficientFunds {
+			return finalResponse, domain.ErrInsufficientFunds
+		}
+		return finalResponse, nil
+	}
+
+	// If transaction failed, check if it was aborted due to lease loss or unrefreshable heartbeat
 	leaseMu.Lock()
 	lost := leaseLostErr
 	leaseMu.Unlock()
 	if lost != nil {
-		return nil, domain.ErrIdempotencyLeaseLost
+		if errors.Is(lost, domain.ErrIdempotencyLeaseLost) {
+			return nil, domain.ErrIdempotencyLeaseLost
+		}
+		return nil, lost
 	}
 
-	if txErr != nil {
-		return nil, txErr
+	// If transaction completed all operations but commit returned an error (commit-ambiguous failure),
+	// resolve and reconcile its outcome before allowing any new owner.
+	if txCompleted {
+		reconcileCtx, rCancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer rCancel()
+		rec, rErr := s.repos.Idempotency.GetIdempotency(reconcileCtx, req.IdempotencyKey)
+		if rErr == nil && rec != nil {
+			if rec.Status == domain.IdempotencyStatusCompleted || rec.Status == domain.IdempotencyStatusFailed {
+				var cachedResp TransferResponse
+				if jsonErr := json.Unmarshal([]byte(rec.ResponseBody), &cachedResp); jsonErr == nil {
+					cachedResp.IsReplay = false
+					cachedResp.ResponseCode = rec.ResponseCode
+					success = true
+					if rec.Status == domain.IdempotencyStatusFailed {
+						return &cachedResp, domain.ErrInsufficientFunds
+					}
+					return &cachedResp, nil
+				}
+			} else if rec.Status == domain.IdempotencyStatusInProgress {
+				transfer, tErr := s.repos.Transfers.GetTransferByID(reconcileCtx, transferID)
+				if tErr == nil && transfer != nil && transfer.Status == domain.TransferStatusProcessed {
+					rec.Status = domain.IdempotencyStatusCompleted
+					rec.TransferID = &transfer.ID
+					rec.ResponseCode = http.StatusCreated
+					rec.ResponseBody = string(respBytes)
+					rec.OwnerToken = ownerToken
+					_ = s.repos.Idempotency.UpdateIdempotency(reconcileCtx, rec)
+					success = true
+					return finalResponse, nil
+				} else if errors.Is(tErr, domain.ErrWalletNotFound) || errors.Is(tErr, pgx.ErrNoRows) || transfer == nil {
+					// Confirmed rolled back: safe to delete in-progress reservation
+					_ = s.repos.Idempotency.DeleteInProgress(reconcileCtx, req.IdempotencyKey, ownerToken)
+				}
+				// If status is still ambiguous (e.g. DB error), keep the reservation intact!
+			}
+		}
 	}
 
-	// Transaction has successfully committed; disarm deferred cleanup
-	success = true
-
-	if isInsufficientFunds {
-		return finalResponse, domain.ErrInsufficientFunds
-	}
-
-	return finalResponse, nil
+	return nil, txErr
 }
 
 func (s *TransferService) mapFailureReasonToError(reason *string, code int) error {

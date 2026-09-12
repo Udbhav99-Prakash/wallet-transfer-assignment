@@ -117,7 +117,7 @@ func (r *ledgerRepository) GetLedgerByWalletID(ctx context.Context, walletID str
 		SELECT id, COALESCE(transfer_id, ''), wallet_id, type, amount, created_at
 		FROM ledger_entries
 		WHERE wallet_id = $1
-		ORDER BY created_at ASC
+		ORDER BY created_at ASC, id ASC
 	`
 	rows, err := r.db.Query(ctx, query, walletID)
 	if err != nil {
