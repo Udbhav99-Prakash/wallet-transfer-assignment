@@ -55,12 +55,32 @@ func main() {
 	}
 	txManager := postgres.NewTxManager(pool)
 
-	// Construct services with explicit transaction capacity reserving pool headroom for background heartbeats
-	maxConcurrentTransfers := int(cfg.DatabaseMaxConns - cfg.HeartbeatHeadroom)
-	if maxConcurrentTransfers <= 0 {
-		maxConcurrentTransfers = 20
+	// Derive transaction concurrency capacity from actual pool.Config().MaxConns
+	actualMaxConns := int(pool.Config().MaxConns)
+	headroom := int(cfg.HeartbeatHeadroom)
+	if headroom >= actualMaxConns {
+		headroom = actualMaxConns / 3
 	}
+	if headroom < 1 {
+		headroom = 1
+	}
+	maxConcurrentTransfers := actualMaxConns - headroom
+	if maxConcurrentTransfers < 1 {
+		maxConcurrentTransfers = 1
+	}
+
 	transferService := service.NewTransferServiceWithCapacity(txManager, repos, maxConcurrentTransfers)
+
+	// Provision dedicated heartbeat pool and wire dedicated heartbeat repository
+	heartbeatPool, hbErr := postgres.NewHeartbeatPool(ctx, cfg.DatabaseURL)
+	if hbErr == nil {
+		defer heartbeatPool.Close()
+		transferService.SetHeartbeatRepo(postgres.NewIdempotencyRepository(heartbeatPool))
+		log.Println("Dedicated heartbeat connection pool initialized successfully.")
+	} else {
+		log.Printf("[WARN] Failed to create dedicated heartbeat pool: %v; falling back to primary pool headroom", hbErr)
+	}
+
 	walletService := service.NewWalletService(txManager, repos)
 
 	// Construct handlers

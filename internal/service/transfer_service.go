@@ -20,6 +20,7 @@ import (
 type TransferService struct {
 	txManager         repository.TxManager
 	repos             repository.Repositories
+	heartbeatRepo     repository.IdempotencyRepository
 	staleTimeout      time.Duration
 	heartbeatInterval time.Duration
 	txSem             chan struct{}
@@ -45,19 +46,9 @@ func NewTransferServiceWithCapacity(txManager repository.TxManager, repos reposi
 	}
 }
 
-func (s *TransferService) sem() chan struct{} {
-	if s.txSem == nil {
-		s.txSem = make(chan struct{}, 20)
-	}
-	return s.txSem
-}
-
-// SetMaxConcurrentTransfers adjusts the transaction semaphore capacity.
-func (s *TransferService) SetMaxConcurrentTransfers(n int) {
-	if n <= 0 {
-		n = 1
-	}
-	s.txSem = make(chan struct{}, n)
+// SetHeartbeatRepo configures a dedicated repository for background lease heartbeats (e.g. backed by a dedicated connection pool).
+func (s *TransferService) SetHeartbeatRepo(repo repository.IdempotencyRepository) {
+	s.heartbeatRepo = repo
 }
 
 // SetStaleTimeout overrides the default stale reservation timeout (useful for testing).
@@ -282,6 +273,10 @@ func (s *TransferService) ExecuteTransfer(ctx context.Context, req CreateTransfe
 
 	reservedRecord, isOwner, err := s.repos.Idempotency.ReserveIdempotency(ctx, record, staleTimeout)
 	if err != nil {
+		// Attempt bounded cleanup with ownerToken in case the reservation was inserted before scan/connection failure
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		_ = s.repos.Idempotency.DeleteInProgress(cleanupCtx, req.IdempotencyKey, ownerToken)
+		cancel()
 		return nil, fmt.Errorf("error reserving idempotency record: %w", err)
 	}
 
@@ -355,7 +350,11 @@ func (s *TransferService) ExecuteTransfer(ctx context.Context, req CreateTransfe
 					hbTimeout = 3 * time.Second
 				}
 				hbCtx, hbCancel := context.WithTimeout(context.Background(), hbTimeout)
-				hbErr := s.repos.Idempotency.HeartbeatIdempotency(hbCtx, req.IdempotencyKey, ownerToken)
+				hbRepo := s.heartbeatRepo
+				if hbRepo == nil {
+					hbRepo = s.repos.Idempotency
+				}
+				hbErr := hbRepo.HeartbeatIdempotency(hbCtx, req.IdempotencyKey, ownerToken)
 				hbCancel()
 				if hbErr != nil {
 					// Discard heartbeat error if heartbeat was already signaled to stop (e.g. after commit)
@@ -413,12 +412,16 @@ func (s *TransferService) ExecuteTransfer(ctx context.Context, req CreateTransfe
 		}
 	}()
 
-	// Acquire transaction semaphore slot to guarantee connection pool headroom for background heartbeats
-	select {
-	case s.sem() <- struct{}{}:
-		defer func() { <-s.sem() }()
-	case <-txCtx.Done():
-		return nil, txCtx.Err()
+	// Acquire transaction semaphore slot to guarantee connection pool headroom for background heartbeats and reads.
+	// Capturing sem locally guarantees that release evaluates the exact same channel.
+	sem := s.txSem
+	if sem != nil {
+		select {
+		case sem <- struct{}{}:
+			defer func() { <-sem }()
+		case <-txCtx.Done():
+			return nil, txCtx.Err()
+		}
 	}
 
 	// 5. Execute transfer inside transaction

@@ -52,31 +52,37 @@ func SetupTestDB(t *testing.T) *pgxpool.Pool {
 
 	dbURL := os.Getenv("TEST_DATABASE_URL")
 	if dbURL == "" {
-		dbURL = "postgres://postgres:postgrespassword@localhost:5432/wallet_test_db?sslmode=disable"
+		dbURL = "postgres://wallet_app:wallet_app_password@localhost:5432/wallet_test_db?sslmode=disable"
 	}
 
 	u, parseErr := url.Parse(dbURL)
 	if parseErr != nil {
-		t.Fatalf("invalid TEST_DATABASE_URL %q: %v", dbURL, parseErr)
+		t.Fatalf("invalid TEST_DATABASE_URL parse error: %v", parseErr)
 	}
-	dbName := strings.TrimPrefix(u.Path, "/")
-	if dbName == "wallet_db" || dbName == "postgres" || !strings.Contains(strings.ToLower(dbName), "test") {
-		t.Fatalf("refusing to run destructive test setup on non-test database %q: TEST_DATABASE_URL must point to a dedicated test database (e.g. containing 'test' in the database name)", dbName)
-	}
-	if appURL := os.Getenv("DATABASE_URL"); appURL != "" {
-		if appU, appErr := url.Parse(appURL); appErr == nil {
-			if strings.EqualFold(appU.Host, u.Host) && strings.EqualFold(strings.TrimPrefix(appU.Path, "/"), dbName) {
-				t.Fatalf("TEST_DATABASE_URL matches application DATABASE_URL (%s); refusing to truncate application database", dbName)
-			}
-		}
-	}
-
-	ensureTestDatabaseExists(dbURL)
 
 	sanitizedEndpoint := "localhost:5432/wallet_test_db"
 	if u.Host != "" {
 		sanitizedEndpoint = u.Host + u.Path
 	}
+
+	dbName := strings.TrimPrefix(u.Path, "/")
+	lowerName := strings.ToLower(dbName)
+	// Explicit allowlist / verification: must be "wallet_test_db" or end with "_test"/"_test_db", and must NOT contain "prod"
+	isAllowedTestDB := (lowerName == "wallet_test_db" || strings.HasSuffix(lowerName, "_test") || strings.HasSuffix(lowerName, "_test_db")) &&
+		!strings.Contains(lowerName, "prod") && !strings.Contains(lowerName, "production")
+
+	if !isAllowedTestDB || dbName == "wallet_db" || dbName == "postgres" {
+		t.Fatalf("refusing to run destructive test setup on unauthorized database: %s. TEST_DATABASE_URL must target an authorized test database (e.g. wallet_test_db)", sanitizedEndpoint)
+	}
+	if appURL := os.Getenv("DATABASE_URL"); appURL != "" {
+		if appU, appErr := url.Parse(appURL); appErr == nil {
+			if strings.EqualFold(appU.Host, u.Host) && strings.EqualFold(strings.TrimPrefix(appU.Path, "/"), dbName) {
+				t.Fatalf("TEST_DATABASE_URL matches application DATABASE_URL (%s); refusing to truncate application database", sanitizedEndpoint)
+			}
+		}
+	}
+
+	ensureTestDatabaseExists(dbURL)
 
 	ctx := context.Background()
 	pool, err := postgres.NewPool(ctx, dbURL)

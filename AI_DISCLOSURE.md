@@ -48,7 +48,7 @@ Antigravity was employed as an active **pair programmer and systems design sound
 
 ## 3. Session Transcript & Prompt Records
 
-The complete transcript of all 67 interaction turns—including exact prompt text, tool invocations, and AI responses—is preserved in this repository:
+The complete transcript of all 68 interaction turns—including exact prompt text, tool invocations, and AI responses—is preserved in this repository:
 - **Readable Session Transcript**: [`AI_TRANSCRIPT.md`](./AI_TRANSCRIPT.md)
 - **Raw Agent Interaction Log**: Persisted in the session metadata logs.
 
@@ -56,7 +56,7 @@ The complete transcript of all 67 interaction turns—including exact prompt tex
 
 ## 4. Chronological List of All Prompts
 
-Below is the complete chronological log of all 67 explicit prompts provided during the development session:
+Below is the complete chronological log of all 68 explicit prompts provided during the development session:
 
 | # | Timestamp (UTC) | Phase | User Prompt |
 |---|---|---|---|
@@ -127,6 +127,7 @@ Below is the complete chronological log of all 67 explicit prompts provided duri
 | **65** | `2026-09-12 08:44:00` | Review Fixes | *In [internal/domain/errors.go]: ErrInvalidIdempotencyKey is described as covering empty and overlong keys, but ExecuteTransfer returns ErrMissingIdempotencyKey for an empty key. This makes the error text misleading wherever the length-specific error is surfaced; make this message describe only the overlong-key condition or align the service behavior.* |
 | **66** | `2026-09-12 09:15:00` | Review Fixes | *[Comprehensive Review on PR #169: CanDebit strict positive amount, bounded ledger pagination, safe-by-default APP_ENV & explicit ADMIN_KEY requirement, owner-token lease update fencing, atomic pending-to-terminal transfer status enforcement, commit-time transfer status trigger verification, migration role separation, and post-acquisition advisory lock cancellation test redesign]* |
 | **67** | `2026-09-12 10:00:00` | Review Fixes | *[Follow-up Review Feedback on PR #169 covering pool headroom & tx semaphore, terminal-only stale recovery, error propagation during transfer lookup, un-locked preflight removal, PostgreSQL 16 schema permissions, and test database validation]* |
+| **68** | `2026-09-12 10:35:00` | Review Fixes | *[Comprehensive Hardening on PR #169: Dedicated heartbeat connection pool isolation, dynamic capacity derivation & immutable tx semaphore, bounded idempotency reservation retry & orphaned state cleanup, single-connection pool (MaxConns=1) migration safety & deferred rollback, terminal transfer status immutability & non-PROCESSED ledger trigger enforcement, CI test execution under least-privileged wallet_app role, test DB allowlist verification & credential sanitization, and full documentation/turn reconciliation]* |
 
 ---
 
@@ -205,3 +206,17 @@ The author is fully prepared to explain and defend every design decision and lin
     - Why `ALL ON SCHEMA public` is granted to `wallet_app`: PostgreSQL 16 restricts public schema permissions by default; `USAGE` alone allows reading existing objects but rejects DDL (`CREATE TABLE IF NOT EXISTS schema_migrations`, etc.). Granting schema creation privileges to `wallet_app` enables migration runners to boot cleanly without needing superuser privileges.
 23. **Destructive Test DB Safeguards**:
     - Why `SetupTestDB` explicitly validates database names and rejects `wallet_db`, `postgres`, and databases matching application `DATABASE_URL`: prevents accidental drops (`DROP DATABASE ... WITH (FORCE)`) or table truncations if `TEST_DATABASE_URL` is misconfigured or points to an application database.
+    - Test database connection error logs sanitize endpoints (`host/path`), preventing password leaks in CI or local output.
+24. **Dedicated Heartbeat Connection Pool & Physical Pool Isolation**:
+    - Why heartbeats use a dedicated connection pool (`postgres.NewHeartbeatPool`): even with transaction concurrency bounding on the main pool, high read volumes (wallet lookups, balance reconciliations, health checks) could consume all primary pool connections. By routing heartbeats through a physically separate 5-connection pool, background lease renewals are guaranteed instant connection acquisition and can never be starved into self-inflicted transaction cancellations.
+25. **Single-Connection Pool (`MaxConns = 1`) Migration Deadlock Elimination**:
+    - Why `Migrate` runs all table checks, DDL statements, and transactions through `lockConn`: on resource-constrained or single-connection databases (`MaxConns = 1`), calling `pool.Exec` or `pool.Begin` while `lockConn` holds an advisory lock would deadlock indefinitely waiting for a connection from the exhausted pool.
+    - Deferred `tx.Rollback(rollbackCtx)` immediately after `lockConn.Begin(ctx)` ensures uncommitted migration transactions release catalog locks without relying on pool connection close.
+26. **Database Invariant Enforcement: Terminal Immutability & Ledger Isolation**:
+    - Why `check_transfer_processed_ledger_pair` disallows updates mutating `OLD.status IN ('PROCESSED', 'FAILED')`: ensures terminal transfer outcomes are immutable at the database boundary and cannot be rewritten by rogue queries or concurrent workers.
+    - Why non-`PROCESSED` transfers (e.g. `PENDING` or `FAILED`) cannot have ledger entries at commit: prevents partial or unfinalized transfers from committing unbalanced ledger rows into the financial audit log.
+27. **Idempotency Reservation Race Resilience & Bounded Cleanup**:
+    - Why `ReserveIdempotency` retries in a bounded loop upon insert conflict when the conflicting row disappears: concurrent rollback or cleanup between the failed insert and subsequent lookup is treated as an immediate acquisition opportunity rather than an internal error.
+    - Why `ExecuteTransfer` initiates a bounded background `DeleteInProgress` on reservation errors: prevents leaving orphaned `IN_PROGRESS` records if context cancellation or connection drops occur during key reservation.
+28. **Least-Privilege Execution in CI**:
+    - Why CI runs integration tests using `wallet_app:wallet_app_password` on `wallet_test_db`: verifies that migrations, table operations, constraint triggers, truncations, and repository queries all succeed under non-superuser privileges, preventing deployment failures caused by missing runtime role grants.

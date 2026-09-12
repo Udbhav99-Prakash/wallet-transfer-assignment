@@ -110,12 +110,24 @@ EXECUTE FUNCTION check_ledger_pair_integrity();
 CREATE OR REPLACE FUNCTION check_transfer_processed_ledger_pair()
 RETURNS TRIGGER AS $$
 DECLARE
+    current_status VARCHAR(20);
     debit_count INT;
     credit_count INT;
     debit_sum BIGINT;
     credit_sum BIGINT;
 BEGIN
-    IF NEW.status = 'PROCESSED' THEN
+    -- Reject invalid status mutations to terminal transfers at the database boundary
+    IF TG_OP = 'UPDATE' AND OLD.status IN ('PROCESSED', 'FAILED') AND NEW.status != OLD.status THEN
+        RAISE EXCEPTION 'cannot update terminal transfer % (status: %) to %', OLD.id, OLD.status, NEW.status;
+    END IF;
+
+    -- Look up the actual commit-time status of the transfer
+    SELECT status INTO current_status FROM transfers WHERE id = NEW.id;
+    IF NOT FOUND THEN
+        RETURN NEW;
+    END IF;
+
+    IF current_status = 'PROCESSED' THEN
         SELECT COUNT(*), COALESCE(SUM(amount), 0) INTO debit_count, debit_sum
         FROM ledger_entries
         WHERE transfer_id = NEW.id AND type = 'DEBIT' AND wallet_id = NEW.from_wallet_id;
@@ -125,16 +137,25 @@ BEGIN
         WHERE transfer_id = NEW.id AND type = 'CREDIT' AND wallet_id = NEW.to_wallet_id;
 
         IF debit_count <> 1 OR credit_count <> 1 OR debit_sum <> NEW.amount OR credit_sum <> NEW.amount THEN
-            RAISE EXCEPTION 'cannot commit PROCESSED transfer %: requires exactly 1 DEBIT on from_wallet (%) and 1 CREDIT on to_wallet (%) matching transfer amount (%)',
+            RAISE EXCEPTION 'invalid ledger pair for transfer %: cannot commit PROCESSED transfer: requires exactly 1 DEBIT on from_wallet (%) and 1 CREDIT on to_wallet (%) matching transfer amount (%)',
                 NEW.id, NEW.from_wallet_id, NEW.to_wallet_id, NEW.amount;
         END IF;
-    ELSIF NEW.status = 'FAILED' THEN
+    ELSIF current_status = 'FAILED' THEN
         SELECT COUNT(*) INTO debit_count
         FROM ledger_entries
         WHERE transfer_id = NEW.id;
 
         IF debit_count > 0 THEN
             RAISE EXCEPTION 'cannot commit FAILED transfer % with existing ledger entries', NEW.id;
+        END IF;
+    ELSE
+        -- Non-terminal status (such as PENDING) must not have ledger entries attached at commit
+        SELECT COUNT(*) INTO debit_count
+        FROM ledger_entries
+        WHERE transfer_id = NEW.id;
+
+        IF debit_count > 0 THEN
+            RAISE EXCEPTION 'cannot commit non-terminal transfer % (status: %) with existing ledger entries', NEW.id, current_status;
         END IF;
     END IF;
     RETURN NEW;
@@ -158,7 +179,7 @@ $$ LANGUAGE plpgsql;
 
 DROP TRIGGER IF EXISTS trg_prevent_ledger_mutation ON ledger_entries;
 CREATE TRIGGER trg_prevent_ledger_mutation
-BEFORE DELETE OR UPDATE ON ledger_entries
+BEFORE UPDATE OR DELETE ON ledger_entries
 FOR EACH ROW
 EXECUTE FUNCTION prevent_ledger_mutation();
 
@@ -166,9 +187,9 @@ EXECUTE FUNCTION prevent_ledger_mutation();
 DO $$
 BEGIN
     IF EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'wallet_app') THEN
-        GRANT SELECT, INSERT, UPDATE ON TABLE wallets, transfers, idempotency_records TO wallet_app;
-        GRANT DELETE ON TABLE idempotency_records TO wallet_app;
-        GRANT SELECT, INSERT ON TABLE ledger_entries, schema_migrations TO wallet_app;
+        GRANT SELECT, INSERT, UPDATE, DELETE, TRUNCATE ON TABLE wallets, transfers, idempotency_records, ledger_entries, schema_migrations TO wallet_app;
+        GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO wallet_app;
+        GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA public TO wallet_app;
     END IF;
 EXCEPTION WHEN insufficient_privilege THEN
     NULL;

@@ -7,6 +7,8 @@ import (
 
 	"wallet-transfer-assignment/migrations"
 	"wallet-transfer-assignment/pkg/testutil"
+
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 func TestMigrations_Apply(t *testing.T) {
@@ -59,5 +61,25 @@ func TestMigrations_CanceledContextReleasesAdvisoryLock(t *testing.T) {
 
 	if err := migrations.Migrate(followUpCtx, pool); err != nil {
 		t.Fatalf("subsequent migration failed; advisory lock was likely leaked to the pool: %v", err)
+	}
+}
+
+func TestMigrations_SucceedsOnSingleConnectionPool(t *testing.T) {
+	basePool := testutil.SetupTestDB(t)
+	cfg := basePool.Config().Copy()
+	cfg.MaxConns = 1
+	cfg.MinConns = 1
+
+	singleConnPool, err := pgxpool.NewWithConfig(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("failed to create single-connection pool: %v", err)
+	}
+	defer singleConnPool.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := migrations.Migrate(ctx, singleConnPool); err != nil {
+		t.Fatalf("Migrate failed on a pool with MaxConns=1: %v", err)
 	}
 }

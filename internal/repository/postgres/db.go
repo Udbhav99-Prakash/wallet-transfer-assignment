@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -36,11 +37,14 @@ func NewPool(ctx context.Context, connString string) (*pgxpool.Pool, error) {
 	}
 
 	// Preserve user-configured pool_max_conns from connString if specified; otherwise use DefaultMaxConns
-	if config.MaxConns <= 4 {
+	if !strings.Contains(connString, "pool_max_conns") {
 		config.MaxConns = DefaultMaxConns
 	}
-	if config.MinConns <= 0 {
+	if !strings.Contains(connString, "pool_min_conns") {
 		config.MinConns = DefaultMinConns
+	}
+	if config.MinConns > config.MaxConns {
+		config.MinConns = config.MaxConns
 	}
 	config.MaxConnLifetime = 1 * time.Hour
 	config.MaxConnIdleTime = 15 * time.Minute

@@ -23,94 +23,114 @@ func NewIdempotencyRepository(db DBTX) repository.IdempotencyRepository {
 }
 
 func (r *idempotencyRepository) ReserveIdempotency(ctx context.Context, record *domain.IdempotencyRecord, staleTimeout time.Duration) (*domain.IdempotencyRecord, bool, error) {
-	now := time.Now().UTC()
-	record.CreatedAt = now
-	record.UpdatedAt = now
-	if record.OwnerToken == "" {
-		record.OwnerToken = uuid.NewString()
+	if record.IdempotencyKey == "" {
+		return nil, false, domain.ErrInvalidIdempotencyKey
 	}
 
-	insertQuery := `
-		INSERT INTO idempotency_records (idempotency_key, request_hash, owner_token, status, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6)
-		ON CONFLICT (idempotency_key) DO NOTHING
-		RETURNING idempotency_key
-	`
-	var insertedKey string
-	err := r.db.QueryRow(ctx, insertQuery,
-		record.IdempotencyKey,
-		record.RequestHash,
-		record.OwnerToken,
-		string(record.Status),
-		record.CreatedAt,
-		record.UpdatedAt,
-	).Scan(&insertedKey)
-
-	if err == nil {
-		// Successfully inserted new record
-		return record, true, nil
-	}
-
-	if errors.Is(err, pgx.ErrNoRows) {
-		// Conflict: key already exists. Fetch the existing record.
-		existing, getErr := r.GetIdempotency(ctx, record.IdempotencyKey)
-		if getErr != nil {
-			return nil, false, fmt.Errorf("failed to fetch conflicting idempotency record: %w", getErr)
-		}
-		if existing == nil {
-			return nil, false, fmt.Errorf("idempotency record disappeared during reservation")
+	const maxAttempts = 3
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		select {
+		case <-ctx.Done():
+			return nil, false, ctx.Err()
+		default:
 		}
 
-		// Explicit stale-owner recovery with owner token fencing:
-		// If existing record is IN_PROGRESS, matches our request hash, and hasn't been updated for longer than staleTimeout,
-		// the previous owner likely crashed or timed out. Attempt to reclaim it atomically.
-		// If the request hash differs, the key is already bound to a different payload and must NOT be overwritten.
-		if staleTimeout > 0 &&
-			existing.Status == domain.IdempotencyStatusInProgress &&
-			existing.RequestHash == record.RequestHash &&
-			now.Sub(existing.UpdatedAt) > staleTimeout {
-			reclaimQuery := `
-				UPDATE idempotency_records
-				SET owner_token = $1, status = $2, updated_at = $3
-				WHERE idempotency_key = $4 AND request_hash = $5 AND status = 'IN_PROGRESS' AND updated_at <= $6
-				RETURNING idempotency_key
-			`
-			var reclaimedKey string
-			reclaimErr := r.db.QueryRow(ctx, reclaimQuery,
-				record.OwnerToken,
-				string(domain.IdempotencyStatusInProgress),
-				now,
-				record.IdempotencyKey,
-				record.RequestHash,
-				existing.UpdatedAt,
-			).Scan(&reclaimedKey)
+		now := time.Now().UTC()
+		if record.CreatedAt.IsZero() {
+			record.CreatedAt = now
+		}
+		record.UpdatedAt = now
+		if record.OwnerToken == "" {
+			record.OwnerToken = uuid.NewString()
+		}
 
-			if reclaimErr == nil {
-				// Successfully reclaimed stale reservation
-				record.CreatedAt = existing.CreatedAt
-				record.UpdatedAt = now
-				return record, true, nil
+		insertQuery := `
+			INSERT INTO idempotency_records (idempotency_key, request_hash, owner_token, status, created_at, updated_at)
+			VALUES ($1, $2, $3, $4, $5, $6)
+			ON CONFLICT (idempotency_key) DO NOTHING
+			RETURNING idempotency_key
+		`
+		var insertedKey string
+		err := r.db.QueryRow(ctx, insertQuery,
+			record.IdempotencyKey,
+			record.RequestHash,
+			record.OwnerToken,
+			string(record.Status),
+			record.CreatedAt,
+			record.UpdatedAt,
+		).Scan(&insertedKey)
+
+		if err == nil {
+			// Successfully inserted new record
+			return record, true, nil
+		}
+
+		if errors.Is(err, pgx.ErrNoRows) {
+			// Conflict: key already exists. Fetch the existing record.
+			existing, getErr := r.GetIdempotency(ctx, record.IdempotencyKey)
+			if getErr != nil {
+				return nil, false, fmt.Errorf("failed to fetch conflicting idempotency record: %w", getErr)
+			}
+			if existing == nil {
+				// The conflicting row was deleted concurrently by the previous owner's cleanup.
+				// Retry the reservation attempt since the key is now available.
+				continue
 			}
 
-			if errors.Is(reclaimErr, pgx.ErrNoRows) {
-				// Another worker reclaimed or completed it concurrently, or request hash changed; fetch latest state
-				refetched, refetchErr := r.GetIdempotency(ctx, record.IdempotencyKey)
-				if refetchErr != nil {
-					return nil, false, fmt.Errorf("failed to refetch idempotency record after reclaim conflict: %w", refetchErr)
+			// Explicit stale-owner recovery with owner token fencing:
+			// If existing record is IN_PROGRESS, matches our request hash, and hasn't been updated for longer than staleTimeout,
+			// the previous owner likely crashed or timed out. Attempt to reclaim it atomically.
+			// If the request hash differs, the key is already bound to a different payload and must NOT be overwritten.
+			if staleTimeout > 0 &&
+				existing.Status == domain.IdempotencyStatusInProgress &&
+				existing.RequestHash == record.RequestHash &&
+				now.Sub(existing.UpdatedAt) > staleTimeout {
+				reclaimQuery := `
+					UPDATE idempotency_records
+					SET owner_token = $1, status = $2, updated_at = $3
+					WHERE idempotency_key = $4 AND request_hash = $5 AND status = 'IN_PROGRESS' AND updated_at <= $6
+					RETURNING idempotency_key
+				`
+				var reclaimedKey string
+				reclaimErr := r.db.QueryRow(ctx, reclaimQuery,
+					record.OwnerToken,
+					string(domain.IdempotencyStatusInProgress),
+					now,
+					record.IdempotencyKey,
+					record.RequestHash,
+					existing.UpdatedAt,
+				).Scan(&reclaimedKey)
+
+				if reclaimErr == nil {
+					// Successfully reclaimed stale reservation
+					record.CreatedAt = existing.CreatedAt
+					record.UpdatedAt = now
+					return record, true, nil
 				}
-				if refetched == nil {
-					return nil, false, fmt.Errorf("idempotency record disappeared after reclaim conflict")
+
+				if errors.Is(reclaimErr, pgx.ErrNoRows) {
+					// Another worker reclaimed or completed it concurrently, or request hash changed; fetch latest state
+					refetched, refetchErr := r.GetIdempotency(ctx, record.IdempotencyKey)
+					if refetchErr != nil {
+						return nil, false, fmt.Errorf("failed to refetch idempotency record after reclaim conflict: %w", refetchErr)
+					}
+					if refetched == nil {
+						// Conflicting row disappeared; retry reservation
+						continue
+					}
+					return refetched, false, nil
 				}
-				return refetched, false, nil
+
+				return nil, false, fmt.Errorf("failed to reclaim stale idempotency reservation: %w", reclaimErr)
 			}
 
-			return nil, false, fmt.Errorf("failed to reclaim stale idempotency reservation: %w", reclaimErr)
+			return existing, false, nil
 		}
 
-		return existing, false, nil
+		return nil, false, fmt.Errorf("failed to reserve idempotency key: %w", err)
 	}
 
-	return nil, false, fmt.Errorf("failed to reserve idempotency key: %w", err)
+	return nil, false, fmt.Errorf("failed to reserve idempotency key after %d attempts: conflicting record repeatedly disappeared", maxAttempts)
 }
 
 func (r *idempotencyRepository) GetIdempotency(ctx context.Context, key string) (*domain.IdempotencyRecord, error) {

@@ -230,6 +230,10 @@ BEGIN
     IF NEW.transfer_id IS NOT NULL THEN
         SELECT * INTO transfer_rec FROM transfers WHERE id = NEW.transfer_id;
         IF FOUND THEN
+            IF transfer_rec.status <> 'PROCESSED' THEN
+                RAISE EXCEPTION 'invalid ledger pair for transfer %: transfer status must be PROCESSED at commit time, got %', NEW.transfer_id, transfer_rec.status;
+            END IF;
+
             SELECT COUNT(*), COALESCE(SUM(amount), 0) INTO debit_count, debit_sum
             FROM ledger_entries
             WHERE transfer_id = NEW.transfer_id AND type = 'DEBIT' AND wallet_id = transfer_rec.from_wallet_id;
@@ -254,16 +258,28 @@ FOR EACH ROW
 EXECUTE FUNCTION check_ledger_pair_integrity();
 
 -- Database-level constraint trigger on transfers enforcing that no transfer can be committed as PROCESSED
--- without an exact, balanced double-entry pair existing in ledger_entries.
+-- without an exact, balanced double-entry pair existing in ledger_entries, and rejecting invalid mutations.
 CREATE OR REPLACE FUNCTION check_transfer_processed_ledger_pair()
 RETURNS TRIGGER AS $$
 DECLARE
+    current_status VARCHAR(20);
     debit_count INT;
     credit_count INT;
     debit_sum BIGINT;
     credit_sum BIGINT;
 BEGIN
-    IF NEW.status = 'PROCESSED' THEN
+    -- Reject invalid status mutations to terminal transfers at the database boundary
+    IF TG_OP = 'UPDATE' AND OLD.status IN ('PROCESSED', 'FAILED') AND NEW.status != OLD.status THEN
+        RAISE EXCEPTION 'cannot update terminal transfer % (status: %) to %', OLD.id, OLD.status, NEW.status;
+    END IF;
+
+    -- Look up the actual commit-time status of the transfer
+    SELECT status INTO current_status FROM transfers WHERE id = NEW.id;
+    IF NOT FOUND THEN
+        RETURN NEW;
+    END IF;
+
+    IF current_status = 'PROCESSED' THEN
         SELECT COUNT(*), COALESCE(SUM(amount), 0) INTO debit_count, debit_sum
         FROM ledger_entries
         WHERE transfer_id = NEW.id AND type = 'DEBIT' AND wallet_id = NEW.from_wallet_id;
@@ -273,8 +289,25 @@ BEGIN
         WHERE transfer_id = NEW.id AND type = 'CREDIT' AND wallet_id = NEW.to_wallet_id;
 
         IF debit_count <> 1 OR credit_count <> 1 OR debit_sum <> NEW.amount OR credit_sum <> NEW.amount THEN
-            RAISE EXCEPTION 'cannot commit PROCESSED transfer %: requires exactly 1 DEBIT on from_wallet (%) and 1 CREDIT on to_wallet (%) matching transfer amount (%)',
+            RAISE EXCEPTION 'invalid ledger pair for transfer %: cannot commit PROCESSED transfer: requires exactly 1 DEBIT on from_wallet (%) and 1 CREDIT on to_wallet (%) matching transfer amount (%)',
                 NEW.id, NEW.from_wallet_id, NEW.to_wallet_id, NEW.amount;
+        END IF;
+    ELSIF current_status = 'FAILED' THEN
+        SELECT COUNT(*) INTO debit_count
+        FROM ledger_entries
+        WHERE transfer_id = NEW.id;
+
+        IF debit_count > 0 THEN
+            RAISE EXCEPTION 'cannot commit FAILED transfer % with existing ledger entries', NEW.id;
+        END IF;
+    ELSE
+        -- Non-terminal status (such as PENDING) must not have ledger entries attached at commit
+        SELECT COUNT(*) INTO debit_count
+        FROM ledger_entries
+        WHERE transfer_id = NEW.id;
+
+        IF debit_count > 0 THEN
+            RAISE EXCEPTION 'cannot commit non-terminal transfer % (status: %) with existing ledger entries', NEW.id, current_status;
         END IF;
     END IF;
     RETURN NEW;
@@ -418,10 +451,12 @@ wallet-transfer-assignment/
   - `500 Internal Server Error`: Unhandled database or operational error.
 
 ### 6.2 Supplementary Endpoints (For Inspection & Testing)
-- `POST /wallets`: Create wallet with initial balance.
+- `POST /wallets`: Create unseeded wallet (initialBalance must be 0 for public callers; positive initial balances require administrative authorization).
+- `POST /admin/wallets`: Create wallet with initial balance funded from system treasury (requires administrative authorization via `X-Admin-Key` or Bearer token).
 - `GET /wallets/{id}`: Retrieve wallet info and current balance.
 - `GET /transfers/{id}`: Retrieve transfer details.
-- `GET /wallets/{id}/ledger`: Retrieve ledger history for audit verification.
+- `GET /wallets/{id}/ledger`: Retrieve bounded paginated ledger history (`?limit=50&offset=0`) for audit verification.
+- `GET /wallets/{id}/reconcile`: Audit stored wallet balance against historical ledger entries.
 
 ---
 
@@ -564,14 +599,14 @@ curl "http://localhost:8080/wallets/alice_wallet/ledger?limit=10&offset=0"
 The test suite executes against an isolated PostgreSQL test database (`wallet_test_db`). To run all tests across all packages:
 ```bash
 # Set test database URL (optional if using local docker defaults)
-export TEST_DATABASE_URL="postgres://postgres:postgres@localhost:5432/wallet_test_db?sslmode=disable"
+export TEST_DATABASE_URL="postgres://wallet_app:wallet_app_password@localhost:5432/wallet_test_db?sslmode=disable"
 
 # Execute all tests with cache disabled
 go test -v -count=1 ./...
 ```
 *(On Windows PowerShell:)*
 ```powershell
-$env:TEST_DATABASE_URL = "postgres://postgres:postgres@localhost:5432/wallet_test_db?sslmode=disable"
+$env:TEST_DATABASE_URL = "postgres://wallet_app:wallet_app_password@localhost:5432/wallet_test_db?sslmode=disable"
 go test -v -count=1 ./...
 ```
 
