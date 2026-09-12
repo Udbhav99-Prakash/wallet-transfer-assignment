@@ -15,10 +15,12 @@ var ErrMissingAdminKey = errors.New("ADMIN_KEY must be explicitly configured in 
 
 // Config holds runtime configuration settings.
 type Config struct {
-	Environment string
-	Port        string
-	DatabaseURL string
-	AdminKey    string
+	Environment       string
+	Port              string
+	DatabaseURL       string
+	DatabaseMaxConns  int32
+	HeartbeatHeadroom int32
+	AdminKey          string
 }
 
 // Load reads configuration from environment variables.
@@ -66,11 +68,16 @@ func Load() (*Config, error) {
 		adminKey = "admin-secret-dev"
 	}
 
+	maxConns := int32(30)
+	headroom := int32(10)
+
 	return &Config{
-		Environment: env,
-		Port:        port,
-		DatabaseURL: dbURL,
-		AdminKey:    adminKey,
+		Environment:       env,
+		Port:              port,
+		DatabaseURL:       dbURL,
+		DatabaseMaxConns:  maxConns,
+		HeartbeatHeadroom: headroom,
+		AdminKey:          adminKey,
 	}, nil
 }
 

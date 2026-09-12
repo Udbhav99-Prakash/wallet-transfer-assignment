@@ -3663,5 +3663,75 @@ All code review comments have been methodically addressed and verified across th
 
 All tests pass (`go test -count=1 ./...`) and `go vet ./...` succeeds with zero warnings.
 
+---
+
+## Turn 67 — 2026-09-12T10:00:00Z
+
+### User Request
+```text
+internal/repository/postgres/db.go:29
+Every active transfer holds one connection from this pool for its transaction, while its heartbeat obtains another connection from the same pool. At 30 concurrent transactions, heartbeats can be starved, causing the consecutive-failure logic to cancel otherwise healthy transfers and produce self-inflicted lease loss. Reserve pool headroom, use a dedicated heartbeat pool, or make the capacity relationship explicit and configurable.
+
+internal/service/transfer_service.go:100
+This recovery branch treats every transfer status other than FAILED as completed, including PENDING. A stale reservation can point at a nonterminal transfer, so this would cache a PENDING response as COMPLETED and return HTTP 201 even though no transfer outcome was finalized. Only recover terminal PROCESSED/FAILED transfers; keep or explicitly reconcile a PENDING record instead.
+
+In [internal/service/transfer_service.go]:
+If GetTransferByIdempotencyKey returns a transient database/network error, this condition is false and the code falls through to ReserveIdempotency, which can reclaim the stale lease and execute a second transfer even though the original transaction may already have committed. Reclaim is safe only after an explicit not-found result; propagate lookup errors and retain the reservation for recovery.
+This issue also appears on line 94 of the same file.
+
+In [internal/service/transfer_service.go]:
+If the destination wallet has already reached its balance limit, this preflight check returns ErrExceedsBalanceLimit and the deferred cleanup removes the idempotency reservation before acquiring any transaction or row lock. A concurrent transfer can debit or credit the destination wallet in the gap between this preflight and the transaction, making the decision stale. Either perform this check under the row lock inside the transaction or avoid releasing the reservation when rejecting requests based on volatile state.
+
+In [scripts/init-user.sql]:
+The init script creates wallet_db and wallet_test_db owned by postgres, but only grants USAGE on the public schema to wallet_app. In PostgreSQL 16, USAGE allows resolving existing relations but does not allow creating new ones (such as schema_migrations or application tables). A deployment running migrations under wallet_app will fail with a permission-denied error. Grant CREATE or transfer schema ownership so migration execution succeeds.
+
+In [pkg/testutil/db.go]:
+SetupTestDB issues DROP DATABASE ... WITH (FORCE) and TRUNCATE based on TEST_DATABASE_URL, with a fallback to localhost:5432/wallet_test_db. If a developer or CI job sets TEST_DATABASE_URL to point at a shared or production database (or if DATABASE_URL is copied), this helper will drop or truncate live data without confirming that the database name matches a test pattern. Validate that the target database name is explicitly a test database (e.g. contains test) or reject destructive commands against non-test connection strings.
+
+In [problem_understanding.md]:
+The setup documentation in section 9 lists Go 1.22 or newer, but go.mod specifies go 1.23.1. Additionally, the compose password in section 9.2 is documented as postgres, but docker-compose.yml defines POSTGRES_PASSWORD: postgrespassword. The configuration table also documents the default DATABASE_URL using the superuser postgres instead of wallet_app, and the section 10.4 test command only includes TestDatabase; update it so the migrations integration tests mentioned above are also executed.
+```
+
+**Tools Executed**: `view_file`, `replace_file_content`, `run_command`
+
+### AI Response / Outcome
+
+All 6 follow-up review issues and documentation discrepancies have been addressed, verified, and integrated into the test suite:
+
+1. **Connection Pool Headroom & Transaction Bounding ([`internal/repository/postgres/db.go`](file:///c:/Go/src/wallet-transfer-assignment/internal/repository/postgres/db.go#L25-L55), [`internal/config/config.go`](file:///c:/Go/src/wallet-transfer-assignment/internal/config/config.go#L20-L40), [`internal/service/transfer_service.go`](file:///c:/Go/src/wallet-transfer-assignment/internal/service/transfer_service.go#L30-L65))**:
+   - Added `DatabaseMaxConns` (default 30) and `HeartbeatHeadroom` (default 10) to configuration.
+   - Updated `postgres.NewPool` to respect `pool_max_conns` URL parameter or apply `DefaultMaxConns`. Exported `DefaultMaxConns`, `DefaultMinConns`, and `DefaultHeartbeatHeadroom`.
+   - Exported `postgres.NewHeartbeatPool` helper for dedicated heartbeat connection pool provisioning.
+   - Implemented a transaction concurrency semaphore (`txSem`) in `TransferService` bounding active transactions to `maxConcurrentTransfers = pool.MaxConns - HeartbeatHeadroom` (e.g. 20 concurrent transactions out of 30 max connections), guaranteeing dedicated headroom for heartbeats and reads without pool starvation.
+   - Added unit test `TestTransferService_TxSemaphore_PreservesHeadroom` using a custom `blockingTxManager` verifying that excess concurrent transactions wait on the semaphore while reads and heartbeats succeed concurrently without delay.
+
+2. **Strict Terminal Stale Recovery & Transient Error Propagation ([`internal/service/transfer_service.go`](file:///c:/Go/src/wallet-transfer-assignment/internal/service/transfer_service.go#L90-L145))**:
+   - Stale reservation recovery only treats `PROCESSED` (201) and `FAILED` (422) transfers as terminal and recoverable. Non-terminal transfers (`PENDING`) are not recovered or cached as completed; `domain.ErrIdempotencyInProgress` is returned so clients retry after the transaction resolves.
+   - Propagated lookup errors in stale recovery: if `GetTransferByIdempotencyKey` returns a database error (anything other than `ErrTransferNotFound` / `pgx.ErrNoRows`), the error is returned immediately and the reservation is retained for recovery rather than proceeding to reclaim the lease.
+   - Guarded `cleanupStaleReservation`: only deletes an in-progress reservation if `GetTransferByIdempotencyKey` explicitly returns `ErrTransferNotFound` or `pgx.ErrNoRows`. On operational errors, the reservation is preserved to prevent duplicate execution.
+   - Added unit tests `TestTransferService_StaleRecovery_PendingTransfer_ReturnsInProgress`, `TestTransferService_StaleRecovery_LookupError_PropagatesError`, and `TestTransferService_CleanupStaleReservation_LookupError_RetainsReservation`.
+   - Fixed `UpdateIdempotency` in `internal/repository/postgres/idempotency_repo.go` to preserve `record.UpdatedAt` when set rather than unconditionally overriding with `time.Now().UTC()`.
+
+3. **Volatile Preflight Removal for Strict In-Transaction Locking ([`internal/service/transfer_service.go`](file:///c:/Go/src/wallet-transfer-assignment/internal/service/transfer_service.go#L70-L85))**:
+   - Removed un-locked preflight `!toWalletPre.CanCredit(req.Amount)`, eliminating the race window where volatile destination wallet state could prematurely reject a transfer and delete the idempotency key before acquiring row locks.
+   - Destination wallet balance limits and currency validations are strictly evaluated inside the ACID transaction under `SELECT ... FOR UPDATE` row locks.
+
+4. **PostgreSQL 16 Schema Permissions for Migration Execution ([`scripts/init-user.sql`](file:///c:/Go/src/wallet-transfer-assignment/scripts/init-user.sql#L10-L25))**:
+   - Granted `ALL ON SCHEMA public` to `wallet_app` on `wallet_db` and `wallet_test_db`.
+   - Added `ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES/SEQUENCES/FUNCTIONS TO wallet_app`, allowing migrations and DDL to execute cleanly under PostgreSQL 16.
+
+5. **Test Database URL Protection Against Accidental Production Mutation ([`pkg/testutil/db.go`](file:///c:/Go/src/wallet-transfer-assignment/pkg/testutil/db.go#L55-L75))**:
+   - Added strict database name validation rejecting non-test targets (`wallet_db`, `postgres`, or names without `"test"`).
+   - Rejected `TEST_DATABASE_URL` matching the application's `DATABASE_URL` to prevent accidental truncates or drops of application data.
+
+6. **Documentation and Test Runner Alignment ([`problem_understanding.md`](file:///c:/Go/src/wallet-transfer-assignment/problem_understanding.md#L470-L600))**:
+   - Aligned Go prerequisite to Go `1.23.1` (matching `go.mod`).
+   - Aligned Docker Compose superuser password to `postgrespassword` (matching `docker-compose.yml`).
+   - Updated configuration table with `wallet_app` URL and required-in-non-dev status.
+   - Consolidated section 10.4 test command to `go test -v -count=1 -run "TestDatabase|TestMigrations" ./...`, executing both migration runner tests and deferred database trigger integrity tests.
+
+All tests pass (`go test -count=1 ./...`) and `go vet ./...` succeeds with zero warnings.
+
+
 
 

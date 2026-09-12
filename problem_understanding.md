@@ -469,7 +469,7 @@ Following the Red-Green-Refactor (TDD) development discipline and comprehensive 
 ## 9. How to Run
 
 ### 9.1 Prerequisites
-- **Go**: 1.22 or newer
+- **Go**: 1.23.1 or newer (matching `go.mod`)
 - **Docker & Docker Compose**: For local PostgreSQL cluster
 - **PostgreSQL Client (Optional)**: `psql` for database inspection
 
@@ -479,16 +479,17 @@ Start the PostgreSQL container with persistent storage and initialized roles/dat
 docker-compose up -d
 ```
 The compose file spins up PostgreSQL on port `5432` with credentials:
-- User: `postgres`
-- Password: `postgres`
+- Superuser: `postgres`
+- Superuser Password: `postgrespassword`
 - Primary Database: `wallet_db`
 - Test Database: `wallet_test_db` (provisioned via `scripts/init-user.sql`)
+- Least-Privilege Application User: `wallet_app` (Password: `wallet_app_password`)
 
 ### 9.3 Configuration Environment Variables
 The application reads configuration from environment variables with production-safe defaults:
 | Variable | Description | Default | Required in Non-Dev |
 | :--- | :--- | :--- | :--- |
-| `DATABASE_URL` | PostgreSQL connection string | `postgres://postgres:postgres@localhost:5432/wallet_db?sslmode=disable` | No |
+| `DATABASE_URL` | PostgreSQL connection string | `postgres://wallet_app:wallet_app_password@localhost:5432/wallet_db?sslmode=disable` (dev only) | Yes |
 | `PORT` | HTTP server listening port | `8080` | No |
 | `APP_ENV` | Application environment (`development`, `production`, etc.) | `production` (safe default) | No |
 | `ADMIN_KEY` | Bearer token for `/admin/*` endpoints | `admin-secret-dev` (only if `APP_ENV=development` & default URL) | Yes |
@@ -589,6 +590,7 @@ go test -v -count=1 -run "TestTransferService_Concurrent" ./internal/service/...
 ### 10.4 Running Database Trigger & Migration Integrity Tests
 Verify migration advisory locking, schema validation, and constraint triggers:
 ```bash
-go test -v -count=1 ./migrations/...
+# Run migration runner, advisory locking, and database constraint trigger tests
+go test -v -count=1 -run "TestDatabase|TestMigrations" ./...
 ```
 

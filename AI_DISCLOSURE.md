@@ -48,7 +48,7 @@ Antigravity was employed as an active **pair programmer and systems design sound
 
 ## 3. Session Transcript & Prompt Records
 
-The complete transcript of all 66 interaction turns—including exact prompt text, tool invocations, and AI responses—is preserved in this repository:
+The complete transcript of all 67 interaction turns—including exact prompt text, tool invocations, and AI responses—is preserved in this repository:
 - **Readable Session Transcript**: [`AI_TRANSCRIPT.md`](./AI_TRANSCRIPT.md)
 - **Raw Agent Interaction Log**: Persisted in the session metadata logs.
 
@@ -56,7 +56,7 @@ The complete transcript of all 66 interaction turns—including exact prompt tex
 
 ## 4. Chronological List of All Prompts
 
-Below is the complete chronological log of all 66 explicit prompts provided during the development session:
+Below is the complete chronological log of all 67 explicit prompts provided during the development session:
 
 | # | Timestamp (UTC) | Phase | User Prompt |
 |---|---|---|---|
@@ -126,6 +126,7 @@ Below is the complete chronological log of all 66 explicit prompts provided duri
 | **64** | `2026-09-12 08:38:00` | Review Fixes | *In [migrations/000001_init_schema.sql]: These deferred triggers and the immutability trigger are the database's last line of defense for the ledger, but the integration tests only validate pair shape in CreateLedgerEntries before SQL executes and exercise valid application transfers. They do not attempt an invalid wallet/type pair or an UPDATE/DELETE against PostgreSQL, so a broken trigger definition could pass the suite while allowing unbalanced or mutable ledger data. Add integration assertions that malformed pairs fail at commit and ledger mutations are rejected.* |
 | **65** | `2026-09-12 08:44:00` | Review Fixes | *In [internal/domain/errors.go]: ErrInvalidIdempotencyKey is described as covering empty and overlong keys, but ExecuteTransfer returns ErrMissingIdempotencyKey for an empty key. This makes the error text misleading wherever the length-specific error is surfaced; make this message describe only the overlong-key condition or align the service behavior.* |
 | **66** | `2026-09-12 09:15:00` | Review Fixes | *[Comprehensive Review on PR #169: CanDebit strict positive amount, bounded ledger pagination, safe-by-default APP_ENV & explicit ADMIN_KEY requirement, owner-token lease update fencing, atomic pending-to-terminal transfer status enforcement, commit-time transfer status trigger verification, migration role separation, and post-acquisition advisory lock cancellation test redesign]* |
+| **67** | `2026-09-12 10:00:00` | Review Fixes | *[Follow-up Review Feedback on PR #169 covering pool headroom & tx semaphore, terminal-only stale recovery, error propagation during transfer lookup, un-locked preflight removal, PostgreSQL 16 schema permissions, and test database validation]* |
 
 ---
 
@@ -167,34 +168,40 @@ The author is fully prepared to explain and defend every design decision and lin
 9. **Migration Advisory Lock Defer Ordering & Pool Connection Safety**:
    - Registering the `pg_advisory_unlock` defer immediately upon acquiring `lockConn` before attempting `SELECT pg_advisory_lock($1)` guarantees that if the lock is granted by PostgreSQL but the client context is canceled or encounters network disruption, the deferred unlock runs with `context.Background()` before `lockConn.Release()` returns the connection to the pool. This eliminates the risk of returning a connection holding the migration lock back to the pool, which would cause subsequent migrations to block indefinitely.
 10. **System Treasury Protection & Administrative Funding Isolation**:
-   - Why `system_treasury` is strictly restricted in public transfers: direct peer-to-peer transfers on `POST /transfers` or `TransferService.ExecuteTransfer` reject requests referencing `system_treasury` as source or destination (`ErrSystemTreasuryRestricted`, HTTP `403 Forbidden`), completely preventing unauthenticated attackers from draining or tampering with treasury funds.
-   - Initial wallet funding on the public router `POST /wallets` rejects positive balances (`initialBalance > 0`) unless administrative authorization (`X-Admin-Key` / Bearer token) is supplied (`domain.ErrUnauthorizedFunding`, HTTP `403 Forbidden`). Public callers can only create unseeded wallets with balance 0.
-   - Dedicated `POST /admin/wallets` endpoint provides an authorized path for initial balance seeding (`401 Unauthorized` without credentials).
-   - Programmatic service invocations (`walletService.CreateWallet`) preserve out-of-band balance seeding for test fixtures and database migrations, guarded against public context leaks by `service.ContextWithPublicCaller`.
-   - `AdminKey` is loaded via `internal/config/config.go` and is strictly required in non-development environments, defaulting to `"admin-secret-dev"` in local development and tests.
+    - Why `system_treasury` is strictly restricted in public transfers: direct peer-to-peer transfers on `POST /transfers` or `TransferService.ExecuteTransfer` reject requests referencing `system_treasury` as source or destination (`ErrSystemTreasuryRestricted`, HTTP `403 Forbidden`), completely preventing unauthenticated attackers from draining or tampering with treasury funds.
+    - Initial wallet funding on the public router `POST /wallets` rejects positive balances (`initialBalance > 0`) unless administrative authorization (`X-Admin-Key` / Bearer token) is supplied (`domain.ErrUnauthorizedFunding`, HTTP `403 Forbidden`). Public callers can only create unseeded wallets with balance 0.
+    - Dedicated `POST /admin/wallets` endpoint provides an authorized path for initial balance seeding (`401 Unauthorized` without credentials).
+    - Programmatic service invocations (`walletService.CreateWallet`) preserve out-of-band balance seeding for test fixtures and database migrations, guarded against public context leaks by `service.ContextWithPublicCaller`.
+    - `AdminKey` is loaded via `internal/config/config.go` and is strictly required in non-development environments, defaulting to `"admin-secret-dev"` in local development and tests.
 11. **Direct Database Trigger & Constraint Integration Assertions**:
-   - Why application-level validation is insufficient without database-level trigger verification: application logic could theoretically have bugs or be bypassed by manual SQL or scripts.
-   - Dedicated integration test suite directly exercises PostgreSQL triggers:
-     - `TestDatabaseTriggers_RejectLedgerMutation_UpdateAndDelete`: asserts that raw SQL `UPDATE` and `DELETE` queries targeting `ledger_entries` are rejected by `trg_prevent_ledger_mutation` with `"ledger entries are immutable: deletions and updates are forbidden"`.
-     - `TestDatabaseConstraints_RejectDuplicateLedgerEntryType`: asserts that duplicate entry types (e.g. 2 `DEBIT` records for the same transfer) fail immediately under unique index `idx_ledger_entries_transfer_type`.
-     - `TestDatabaseTriggers_MalformedLedgerPairFailsAtCommit`: asserts that single debits, single credits, mismatched source wallets, mismatched destination wallets, and differing debit/credit amounts fail at transaction `Commit()` under deferred constraint trigger `trg_check_ledger_pair` with `"invalid ledger pair for transfer"`.
-     - `TestDatabaseTriggers_ProcessedTransferWithoutLedgerPairFailsAtCommit`: asserts that committing a transfer with `status = 'PROCESSED'` without balanced ledger entries fails at `Commit()` under deferred constraint trigger `trg_check_transfer_processed` with `"cannot commit PROCESSED transfer"`.
+    - Why application-level validation is insufficient without database-level trigger verification: application logic could theoretically have bugs or be bypassed by manual SQL or scripts.
+    - Dedicated integration test suite directly exercises PostgreSQL triggers:
+      - `TestDatabaseTriggers_RejectLedgerMutation_UpdateAndDelete`: asserts that raw SQL `UPDATE` and `DELETE` queries targeting `ledger_entries` are rejected by `trg_prevent_ledger_mutation` with `"ledger entries are immutable: deletions and updates are forbidden"`.
+      - `TestDatabaseConstraints_RejectDuplicateLedgerEntryType`: asserts that duplicate entry types (e.g. 2 `DEBIT` records for the same transfer) fail immediately under unique index `idx_ledger_entries_transfer_type`.
+      - `TestDatabaseTriggers_MalformedLedgerPairFailsAtCommit`: asserts that single debits, single credits, mismatched source wallets, mismatched destination wallets, and differing debit/credit amounts fail at transaction `Commit()` under deferred constraint trigger `trg_check_ledger_pair` with `"invalid ledger pair for transfer"`.
+      - `TestDatabaseTriggers_ProcessedTransferWithoutLedgerPairFailsAtCommit`: asserts that committing a transfer with `status = 'PROCESSED'` without balanced ledger entries fails at `Commit()` under deferred constraint trigger `trg_check_transfer_processed` with `"cannot commit PROCESSED transfer"`.
 12. **Strict Positive Debit Predicate**:
-   - Why `CanDebit(amount)` strictly requires `amount > 0 && w.Balance >= amount`: aligns with `CanCredit` and `Debit` validation, preventing callers using `CanDebit` from approving zero or negative debit requests.
+    - Why `CanDebit(amount)` strictly requires `amount > 0 && w.Balance >= amount`: aligns with `CanCredit` and `Debit` validation, preventing callers using `CanDebit` from approving zero or negative debit requests.
 13. **Bounded Ledger History Pagination**:
-   - Why `GetLedgerByWalletID` enforces bounded limits (default 50, maximum 100) and offset parameters: unbounded materialization of historical financial rows would lead to memory bloat, high latency, and request timeouts for long-lived active wallets.
+    - Why `GetLedgerByWalletID` enforces bounded limits (default 50, maximum 100) and offset parameters: unbounded materialization of historical financial rows would lead to memory bloat, high latency, and request timeouts for long-lived active wallets.
 14. **Safe-by-Default Configuration Security**:
-   - Why omitted `APP_ENV` defaults to `production` and requires explicit `DATABASE_URL` and `ADMIN_KEY`: avoids running in production with accidental development fallback credentials (`admin-secret-dev`), protecting sensitive admin endpoints.
+    - Why omitted `APP_ENV` defaults to `production` and requires explicit `DATABASE_URL` and `ADMIN_KEY`: avoids running in production with accidental development fallback credentials (`admin-secret-dev`), protecting sensitive admin endpoints.
 15. **Complete Owner-Token Lease Fencing**:
-   - Why all `UpdateIdempotency` calls must require a non-empty `OwnerToken` with `owner_token = $6` in the SQL predicate: eliminating un-fenced update fallbacks guarantees that no stale, expired, or non-leaseholding worker can overwrite or tamper with an active idempotency reservation.
+    - Why all `UpdateIdempotency` calls must require a non-empty `OwnerToken` with `owner_token = $6` in the SQL predicate: eliminating un-fenced update fallbacks guarantees that no stale, expired, or non-leaseholding worker can overwrite or tamper with an active idempotency reservation.
 16. **Atomic Pending-to-Terminal Transfer Transitions**:
-   - Why `UpdateTransferStatus` enforces `WHERE id = $4 AND status = 'PENDING'`: once a transfer reaches a terminal state (`PROCESSED` or `FAILED`), it is immutable. Guarding the update with `status = 'PENDING'` and returning `domain.ErrInvalidStateTransition` if 0 rows are updated prevents concurrent retries, background workers, or timeout handlers from corrupting or overwriting terminal outcomes.
+    - Why `UpdateTransferStatus` enforces `WHERE id = $4 AND status = 'PENDING'`: once a transfer reaches a terminal state (`PROCESSED` or `FAILED`), it is immutable. Guarding the update with `status = 'PENDING'` and returning `domain.ErrInvalidStateTransition` if 0 rows are updated prevents concurrent retries, background workers, or timeout handlers from corrupting or overwriting terminal outcomes.
 17. **Commit-Time Transfer Status Database Triggers**:
-   - Why `trg_check_ledger_pair` verifies that the transfer's status is `PROCESSED` at commit time: ensures that a transaction cannot commit ledger entries for a transfer marked `FAILED` or left as `PENDING`.
+    - Why `trg_check_ledger_pair` verifies that the transfer's status is `PROCESSED` at commit time: ensures that a transaction cannot commit ledger entries for a transfer marked `FAILED` or left as `PENDING`.
 18. **Separation of Schema Definition from Role Provisioning**:
-   - Why role creation statements are kept in `scripts/init-user.sql` rather than `000001_init_schema.sql`: in cloud production environments, database users and roles are managed by DBAs or infrastructure-as-code (Terraform/IAM) with least privilege (`SELECT, INSERT` on ledger, no `UPDATE`/`DELETE`). Application migration scripts should define tables, triggers, and indexes without hardcoding role creation.
-
-
-
-
-
+    - Why role creation statements are kept in `scripts/init-user.sql` rather than `000001_init_schema.sql`: in cloud production environments, database users and roles are managed by DBAs or infrastructure-as-code (Terraform/IAM) with least privilege (`SELECT, INSERT` on ledger, no `UPDATE`/`DELETE`). Application migration scripts should define tables, triggers, and indexes without hardcoding role creation.
+19. **Connection Pool Headroom Reservation & Transaction Bounding**:
+    - Why we reserve connection headroom (`pool.MaxConns - HeartbeatHeadroom`) and gate active transactions with a counting semaphore (`txSem`): if all connections in `pgxpool` were consumed by transactions, concurrent in-flight heartbeats would be starved of connections. Starved heartbeats would trigger false consecutive failure timeouts and cause self-inflicted transaction cancellations. Transaction bounding guarantees dedicated connections remain available for heartbeats and health checks under high load.
+20. **Terminal-Only Stale Idempotency Recovery & Lookup Error Propagation**:
+    - Why stale recovery only caches and finalizes transfers with status `PROCESSED` or `FAILED`: recovering `PENDING` transfers as completed would report HTTP 201 and finalize idempotency records before the transaction has committed or settled. Non-terminal transfers return `domain.ErrIdempotencyInProgress`.
+    - Why `GetTransferByIdempotencyKey` lookup errors are propagated: reclaiming an idempotency lease when a lookup fails due to a database/network error could execute a duplicate transfer while the original is still committing. Reclaim is permitted only after an explicit `ErrTransferNotFound` or `pgx.ErrNoRows`.
+21. **Strict Removal of Un-Locked Volatile Preflights**:
+    - Why volatile checks like `CanCredit` are removed prior to acquiring row locks: between an un-locked preflight check and the transaction's row-lock acquisition, concurrent transactions can modify wallet balances. Releasing the idempotency reservation on a volatile preflight rejection allows racing requests to bypass idempotency safeguards. All balance limit and currency validations must be performed exclusively under `SELECT ... FOR UPDATE` row locks inside the ACID transaction.
+22. **PostgreSQL 16 Schema Privileges for Least-Privileged Application Roles**:
+    - Why `ALL ON SCHEMA public` is granted to `wallet_app`: PostgreSQL 16 restricts public schema permissions by default; `USAGE` alone allows reading existing objects but rejects DDL (`CREATE TABLE IF NOT EXISTS schema_migrations`, etc.). Granting schema creation privileges to `wallet_app` enables migration runners to boot cleanly without needing superuser privileges.
+23. **Destructive Test DB Safeguards**:
+    - Why `SetupTestDB` explicitly validates database names and rejects `wallet_db`, `postgres`, and databases matching application `DATABASE_URL`: prevents accidental drops (`DROP DATABASE ... WITH (FORCE)`) or table truncations if `TEST_DATABASE_URL` is misconfigured or points to an application database.

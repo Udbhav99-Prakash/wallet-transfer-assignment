@@ -164,12 +164,17 @@ func (r *idempotencyRepository) UpdateIdempotency(ctx context.Context, record *d
 		SET transfer_id = $1, status = $2, response_code = $3, response_body = $4, updated_at = $5
 		WHERE idempotency_key = $6 AND owner_token = $7
 	`
+	updatedAt := record.UpdatedAt
+	if updatedAt.IsZero() {
+		updatedAt = time.Now().UTC()
+	}
+
 	cmdTag, err := r.db.Exec(ctx, query,
 		record.TransferID,
 		string(record.Status),
 		record.ResponseCode,
 		record.ResponseBody,
-		time.Now().UTC(),
+		updatedAt,
 		record.IdempotencyKey,
 		record.OwnerToken,
 	)

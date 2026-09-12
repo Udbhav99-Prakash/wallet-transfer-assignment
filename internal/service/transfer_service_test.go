@@ -2495,3 +2495,238 @@ func TestWalletService_NilTxManagerFails(t *testing.T) {
 		t.Fatalf("expected error containing 'transaction manager is required', got %v", err)
 	}
 }
+
+func TestTransferService_StaleRecovery_PendingTransfer_ReturnsInProgress(t *testing.T) {
+	ctx := context.Background()
+	transferSvc, walletSvc, repos := setupServicesWithRepos(t)
+
+	w1, _ := walletSvc.CreateWallet(ctx, service.CreateWalletRequest{ID: "w_stale_pend_1", Name: "W1", InitialBalance: 500})
+	w2, _ := walletSvc.CreateWallet(ctx, service.CreateWalletRequest{ID: "w_stale_pend_2", Name: "W2", InitialBalance: 500})
+
+	idemKey := "key_stale_pending_" + uuid.NewString()
+	requestHash := domain.ComputeRequestHash(w1.ID, w2.ID, 100)
+
+	// 1. Seed stale in-progress reservation (updated 2 minutes ago)
+	staleTime := time.Now().UTC().Add(-2 * time.Minute)
+	rec, _, err := repos.Idempotency.ReserveIdempotency(ctx, &domain.IdempotencyRecord{
+		IdempotencyKey: idemKey,
+		RequestHash:    requestHash,
+		OwnerToken:     uuid.NewString(),
+		Status:         domain.IdempotencyStatusInProgress,
+		CreatedAt:      staleTime,
+		UpdatedAt:      staleTime,
+	}, 30*time.Second)
+	if err != nil {
+		t.Fatalf("failed to reserve idempotency: %v", err)
+	}
+	rec.UpdatedAt = staleTime
+	if err := repos.Idempotency.UpdateIdempotency(ctx, rec); err != nil {
+		t.Fatalf("failed to update idempotency timestamp: %v", err)
+	}
+
+	// 2. Insert an underlying transfer with PENDING status
+	transferID := uuid.NewString()
+	if err := repos.Transfers.CreateTransfer(ctx, &domain.Transfer{
+		ID:             transferID,
+		IdempotencyKey: idemKey,
+		FromWalletID:   w1.ID,
+		ToWalletID:     w2.ID,
+		Amount:         100,
+		Status:         domain.TransferStatusPending,
+		CreatedAt:      staleTime,
+		UpdatedAt:      staleTime,
+	}); err != nil {
+		t.Fatalf("failed to create pending transfer: %v", err)
+	}
+
+	// 3. Executing transfer must NOT treat PENDING as COMPLETED or return HTTP 201; it must return ErrIdempotencyInProgress
+	resp, err := transferSvc.ExecuteTransfer(ctx, service.CreateTransferRequest{
+		IdempotencyKey: idemKey,
+		FromWalletID:   w1.ID,
+		ToWalletID:     w2.ID,
+		Amount:         100,
+	})
+	if !errors.Is(err, domain.ErrIdempotencyInProgress) {
+		t.Fatalf("expected ErrIdempotencyInProgress for stale reservation pointing to PENDING transfer, got resp: %+v, err: %v", resp, err)
+	}
+
+	// 4. Verify idempotency record remains IN_PROGRESS and was not finalized to COMPLETED
+	finalRec, _ := repos.Idempotency.GetIdempotency(ctx, idemKey)
+	if finalRec != nil && finalRec.Status == domain.IdempotencyStatusCompleted {
+		t.Fatalf("idempotency record was incorrectly finalized to COMPLETED for non-terminal PENDING transfer")
+	}
+}
+
+type lookupFailingTransferRepo struct {
+	repository.TransferRepository
+}
+
+func (f *lookupFailingTransferRepo) GetTransferByIdempotencyKey(ctx context.Context, key string) (*domain.Transfer, error) {
+	return nil, errors.New("simulated operational DB timeout during transfer lookup")
+}
+
+func TestTransferService_StaleRecovery_LookupError_PropagatesError(t *testing.T) {
+	ctx := context.Background()
+	_, walletSvc, repos := setupServicesWithRepos(t)
+
+	w1, _ := walletSvc.CreateWallet(ctx, service.CreateWalletRequest{ID: "w_stale_err_1", Name: "W1", InitialBalance: 500})
+	w2, _ := walletSvc.CreateWallet(ctx, service.CreateWalletRequest{ID: "w_stale_err_2", Name: "W2", InitialBalance: 500})
+
+	idemKey := "key_stale_err_" + uuid.NewString()
+	requestHash := domain.ComputeRequestHash(w1.ID, w2.ID, 100)
+
+	// Seed stale in-progress reservation
+	staleTime := time.Now().UTC().Add(-2 * time.Minute)
+	rec, _, _ := repos.Idempotency.ReserveIdempotency(ctx, &domain.IdempotencyRecord{
+		IdempotencyKey: idemKey,
+		RequestHash:    requestHash,
+		OwnerToken:     uuid.NewString(),
+		Status:         domain.IdempotencyStatusInProgress,
+		CreatedAt:      staleTime,
+		UpdatedAt:      staleTime,
+	}, 30*time.Second)
+	rec.UpdatedAt = staleTime
+	_ = repos.Idempotency.UpdateIdempotency(ctx, rec)
+
+	// Wrap transfer repo with simulated lookup failure
+	faultyRepos := repos
+	faultyRepos.Transfers = &lookupFailingTransferRepo{TransferRepository: repos.Transfers}
+	faultySvc := service.NewTransferService(postgres.NewTxManager(nil), faultyRepos)
+
+	// Attempting stale recovery must fail fast with the lookup error rather than reclaiming
+	_, err := faultySvc.ExecuteTransfer(ctx, service.CreateTransferRequest{
+		IdempotencyKey: idemKey,
+		FromWalletID:   w1.ID,
+		ToWalletID:     w2.ID,
+		Amount:         100,
+	})
+	if err == nil || !strings.Contains(err.Error(), "failed to lookup transfer during stale recovery") {
+		t.Fatalf("expected error containing 'failed to lookup transfer during stale recovery', got %v", err)
+	}
+
+	// Reservation must still exist in IN_PROGRESS
+	stillRec, _ := repos.Idempotency.GetIdempotency(ctx, idemKey)
+	if stillRec == nil || stillRec.Status != domain.IdempotencyStatusInProgress {
+		t.Fatalf("expected reservation to remain intact as IN_PROGRESS after lookup error, got %+v", stillRec)
+	}
+}
+
+func TestTransferService_CleanupStaleReservation_LookupError_RetainsReservation(t *testing.T) {
+	ctx := context.Background()
+	_, walletSvc, repos := setupServicesWithRepos(t)
+
+	w1, _ := walletSvc.CreateWallet(ctx, service.CreateWalletRequest{ID: "w_clean_err_1", Name: "W1", InitialBalance: 500})
+
+	idemKey := "key_cleanup_err_" + uuid.NewString()
+	requestHash := domain.ComputeRequestHash(w1.ID, "w_clean_err_missing", 100)
+
+	// Seed in-progress reservation
+	_, _, err := repos.Idempotency.ReserveIdempotency(ctx, &domain.IdempotencyRecord{
+		IdempotencyKey: idemKey,
+		RequestHash:    requestHash,
+		OwnerToken:     uuid.NewString(),
+		Status:         domain.IdempotencyStatusInProgress,
+	}, 30*time.Second)
+	if err != nil {
+		t.Fatalf("failed to reserve idempotency: %v", err)
+	}
+
+	// Wrap transfer repo with simulated lookup failure
+	faultyRepos := repos
+	faultyRepos.Transfers = &lookupFailingTransferRepo{TransferRepository: repos.Transfers}
+	faultySvc := service.NewTransferService(postgres.NewTxManager(nil), faultyRepos)
+
+	// Execute with invalid payload (missing destination wallet ID) to trigger preflight failure
+	_, err = faultySvc.ExecuteTransfer(ctx, service.CreateTransferRequest{
+		IdempotencyKey: idemKey,
+		FromWalletID:   w1.ID,
+		ToWalletID:     "", // missing wallet ID triggers checkValidationErr
+		Amount:         100,
+	})
+	if err == nil {
+		t.Fatalf("expected validation error, got nil")
+	}
+
+	// Reservation must NOT have been deleted because lookup encountered an operational error
+	stillRec, _ := repos.Idempotency.GetIdempotency(ctx, idemKey)
+	if stillRec == nil {
+		t.Fatalf("reservation was incorrectly deleted despite operational error in transfer lookup")
+	}
+}
+
+type blockingTxManager struct {
+	realTxManager repository.TxManager
+	onEnter       func()
+}
+
+func (m *blockingTxManager) ExecuteInTx(ctx context.Context, fn func(txRepos repository.Repositories) error) error {
+	return m.realTxManager.ExecuteInTx(ctx, func(txRepos repository.Repositories) error {
+		if m.onEnter != nil {
+			m.onEnter()
+		}
+		return fn(txRepos)
+	})
+}
+
+func TestTransferService_TxSemaphore_PreservesHeadroom(t *testing.T) {
+	ctx := context.Background()
+	_, walletSvc, pool, repos := setupServicesWithPool(t)
+	txManager := postgres.NewTxManager(pool)
+
+	w1, _ := walletSvc.CreateWallet(ctx, service.CreateWalletRequest{ID: "w_sem_1", Name: "W1", InitialBalance: 500})
+	w2, _ := walletSvc.CreateWallet(ctx, service.CreateWalletRequest{ID: "w_sem_2", Name: "W2", InitialBalance: 500})
+
+	idemKey1 := "key_sem_1_" + uuid.NewString()
+	idemKey2 := "key_sem_2_" + uuid.NewString()
+
+	enteredTx := make(chan struct{})
+	releaseTx := make(chan struct{})
+
+	blockingTx := &blockingTxManager{
+		realTxManager: txManager,
+		onEnter: func() {
+			close(enteredTx)
+			<-releaseTx
+		},
+	}
+	blockingSvc := service.NewTransferServiceWithCapacity(blockingTx, repos, 1)
+
+	go func() {
+		_, _ = blockingSvc.ExecuteTransfer(ctx, service.CreateTransferRequest{
+			IdempotencyKey: idemKey1,
+			FromWalletID:   w1.ID,
+			ToWalletID:     w2.ID,
+			Amount:         10,
+		})
+	}()
+
+	// Wait until the first transfer has entered the transaction and is holding the slot
+	select {
+	case <-enteredTx:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("timed out waiting for first transfer to enter tx")
+	}
+
+	// A second transfer attempt with a short timeout must block on the semaphore and time out
+	timeoutCtx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	_, err := blockingSvc.ExecuteTransfer(timeoutCtx, service.CreateTransferRequest{
+		IdempotencyKey: idemKey2,
+		FromWalletID:   w1.ID,
+		ToWalletID:     w2.ID,
+		Amount:         20,
+	})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected second transfer to time out waiting for transaction semaphore, got %v", err)
+	}
+
+	// Meanwhile, non-transactional database operations (like heartbeats and reads) must still succeed freely!
+	w1Check, err := repos.Wallets.GetWalletByID(ctx, w1.ID)
+	if err != nil || w1Check == nil {
+		t.Fatalf("expected non-transactional read to succeed despite in-flight transaction, got %v", err)
+	}
+
+	// Release first transfer
+	close(releaseTx)
+}

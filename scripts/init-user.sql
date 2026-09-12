@@ -10,14 +10,21 @@ END $$;
 SELECT 'CREATE DATABASE wallet_test_db OWNER postgres'
 WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'wallet_test_db')\gexec
 
--- Grant connection and schema usage permissions (least-privilege runtime access)
+-- Grant connection, schema DDL, and object privileges for migration execution and runtime access
 GRANT CONNECT ON DATABASE wallet_db TO wallet_app;
 GRANT CONNECT ON DATABASE wallet_test_db TO wallet_app;
 
 \c wallet_db
-GRANT USAGE ON SCHEMA public TO wallet_app;
+GRANT ALL ON SCHEMA public TO wallet_app;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO wallet_app;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO wallet_app;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON FUNCTIONS TO wallet_app;
 
 \c wallet_test_db
-GRANT USAGE ON SCHEMA public TO wallet_app;
+GRANT ALL ON SCHEMA public TO wallet_app;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO wallet_app;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO wallet_app;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON FUNCTIONS TO wallet_app;
+
 
 

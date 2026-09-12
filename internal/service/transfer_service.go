@@ -22,16 +22,42 @@ type TransferService struct {
 	repos             repository.Repositories
 	staleTimeout      time.Duration
 	heartbeatInterval time.Duration
+	txSem             chan struct{}
 }
 
-// NewTransferService constructs a TransferService.
+// NewTransferService constructs a TransferService with default transaction capacity (20).
 func NewTransferService(txManager repository.TxManager, repos repository.Repositories) *TransferService {
+	return NewTransferServiceWithCapacity(txManager, repos, 20)
+}
+
+// NewTransferServiceWithCapacity constructs a TransferService with explicit transaction concurrency capacity,
+// reserving the remaining connection pool headroom for background lease heartbeats and non-tx queries.
+func NewTransferServiceWithCapacity(txManager repository.TxManager, repos repository.Repositories, maxConcurrentTransfers int) *TransferService {
+	if maxConcurrentTransfers <= 0 {
+		maxConcurrentTransfers = 20
+	}
 	return &TransferService{
 		txManager:         txManager,
 		repos:             repos,
 		staleTimeout:      30 * time.Second,
 		heartbeatInterval: 5 * time.Second,
+		txSem:             make(chan struct{}, maxConcurrentTransfers),
 	}
+}
+
+func (s *TransferService) sem() chan struct{} {
+	if s.txSem == nil {
+		s.txSem = make(chan struct{}, 20)
+	}
+	return s.txSem
+}
+
+// SetMaxConcurrentTransfers adjusts the transaction semaphore capacity.
+func (s *TransferService) SetMaxConcurrentTransfers(n int) {
+	if n <= 0 {
+		n = 1
+	}
+	s.txSem = make(chan struct{}, n)
 }
 
 // SetStaleTimeout overrides the default stale reservation timeout (useful for testing).
@@ -90,39 +116,69 @@ func (s *TransferService) ExecuteTransfer(ctx context.Context, req CreateTransfe
 			// If a previous execution committed the transfer but crashed or failed to finalize idempotency_records,
 			// recover and return the committed result rather than executing a duplicate transfer!
 			existingTx, tErr := s.repos.Transfers.GetTransferByIdempotencyKey(ctx, req.IdempotencyKey)
-			if tErr == nil && existingTx != nil {
-				respCode := http.StatusCreated
-				status := domain.IdempotencyStatusCompleted
-				var failureReason *string
-				if existingTx.Status == domain.TransferStatusFailed {
-					respCode = http.StatusUnprocessableEntity
-					status = domain.IdempotencyStatusFailed
-					failureReason = existingTx.FailureReason
+			if tErr != nil {
+				if !errors.Is(tErr, domain.ErrTransferNotFound) && !errors.Is(tErr, pgx.ErrNoRows) {
+					return nil, fmt.Errorf("failed to lookup transfer during stale recovery: %w", tErr)
 				}
-				resp := &TransferResponse{
-					TransferID:     existingTx.ID,
-					IdempotencyKey: existingTx.IdempotencyKey,
-					FromWalletID:   existingTx.FromWalletID,
-					ToWalletID:     existingTx.ToWalletID,
-					Amount:         existingTx.Amount,
-					Status:         existingTx.Status,
-					FailureReason:  failureReason,
-					CreatedAt:      existingTx.CreatedAt,
-					IsReplay:       true,
-					ResponseCode:   respCode,
-				}
-				respBytes, _ := json.Marshal(resp)
-				existing.Status = status
-				existing.TransferID = &existingTx.ID
-				existing.ResponseCode = respCode
-				existing.ResponseBody = string(respBytes)
-				if updateErr := s.repos.Idempotency.UpdateIdempotency(ctx, existing); updateErr != nil {
-					return nil, fmt.Errorf("failed to finalize recovered idempotency record: %w", updateErr)
-				}
-				if status == domain.IdempotencyStatusFailed {
+				// Explicit not-found: safe to fall through to business validation and atomic reclaim
+			} else if existingTx != nil {
+				switch existingTx.Status {
+				case domain.TransferStatusProcessed:
+					respCode := http.StatusCreated
+					status := domain.IdempotencyStatusCompleted
+					resp := &TransferResponse{
+						TransferID:     existingTx.ID,
+						IdempotencyKey: existingTx.IdempotencyKey,
+						FromWalletID:   existingTx.FromWalletID,
+						ToWalletID:     existingTx.ToWalletID,
+						Amount:         existingTx.Amount,
+						Status:         existingTx.Status,
+						FailureReason:  nil,
+						CreatedAt:      existingTx.CreatedAt,
+						IsReplay:       true,
+						ResponseCode:   respCode,
+					}
+					respBytes, _ := json.Marshal(resp)
+					existing.Status = status
+					existing.TransferID = &existingTx.ID
+					existing.ResponseCode = respCode
+					existing.ResponseBody = string(respBytes)
+					if updateErr := s.repos.Idempotency.UpdateIdempotency(ctx, existing); updateErr != nil {
+						return nil, fmt.Errorf("failed to finalize recovered idempotency record: %w", updateErr)
+					}
+					return resp, nil
+
+				case domain.TransferStatusFailed:
+					respCode := http.StatusUnprocessableEntity
+					status := domain.IdempotencyStatusFailed
+					failureReason := existingTx.FailureReason
+					resp := &TransferResponse{
+						TransferID:     existingTx.ID,
+						IdempotencyKey: existingTx.IdempotencyKey,
+						FromWalletID:   existingTx.FromWalletID,
+						ToWalletID:     existingTx.ToWalletID,
+						Amount:         existingTx.Amount,
+						Status:         existingTx.Status,
+						FailureReason:  failureReason,
+						CreatedAt:      existingTx.CreatedAt,
+						IsReplay:       true,
+						ResponseCode:   respCode,
+					}
+					respBytes, _ := json.Marshal(resp)
+					existing.Status = status
+					existing.TransferID = &existingTx.ID
+					existing.ResponseCode = respCode
+					existing.ResponseBody = string(respBytes)
+					if updateErr := s.repos.Idempotency.UpdateIdempotency(ctx, existing); updateErr != nil {
+						return nil, fmt.Errorf("failed to finalize recovered idempotency record: %w", updateErr)
+					}
 					return resp, s.mapFailureReasonToError(failureReason, respCode)
+
+				default:
+					// Transfer is still in non-terminal PENDING state; do not treat as COMPLETED and do not allow reclaim.
+					// Retain the in-progress reservation and return ErrIdempotencyInProgress.
+					return nil, domain.ErrIdempotencyInProgress
 				}
-				return resp, nil
 			}
 			// If stale and no transfer was committed, fall through to business validation and atomic reclaim in ReserveIdempotency.
 		}
@@ -134,8 +190,15 @@ func (s *TransferService) ExecuteTransfer(ctx context.Context, req CreateTransfe
 	// with the exact same precedence as sequential reuses.
 	cleanupStaleReservation := func() {
 		if existing != nil && existing.Status == domain.IdempotencyStatusInProgress {
-			// Do not delete reservation if a transfer was already committed!
-			if existingTx, tErr := s.repos.Transfers.GetTransferByIdempotencyKey(ctx, req.IdempotencyKey); tErr == nil && existingTx != nil {
+			// Do not delete reservation if a transfer was already committed or if lookup encountered an operational error!
+			existingTx, tErr := s.repos.Transfers.GetTransferByIdempotencyKey(ctx, req.IdempotencyKey)
+			if tErr != nil {
+				// Operational error: retain the reservation
+				if !errors.Is(tErr, domain.ErrTransferNotFound) && !errors.Is(tErr, pgx.ErrNoRows) {
+					return
+				}
+			} else if existingTx != nil {
+				// Transfer exists: retain the reservation
 				return
 			}
 			cleanupCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -198,9 +261,6 @@ func (s *TransferService) ExecuteTransfer(ctx context.Context, req CreateTransfe
 	}
 	if fromWalletPre.Currency != toWalletPre.Currency {
 		return nil, checkValidationErr(domain.ErrCurrencyMismatch)
-	}
-	if !toWalletPre.CanCredit(req.Amount) {
-		return nil, checkValidationErr(domain.ErrBalanceOverflow)
 	}
 
 	// 4. Short committed reservation outside the transfer transaction.
@@ -352,6 +412,14 @@ func (s *TransferService) ExecuteTransfer(ctx context.Context, req CreateTransfe
 			_ = s.repos.Idempotency.DeleteInProgress(cleanupCtx, req.IdempotencyKey, ownerToken)
 		}
 	}()
+
+	// Acquire transaction semaphore slot to guarantee connection pool headroom for background heartbeats
+	select {
+	case s.sem() <- struct{}{}:
+		defer func() { <-s.sem() }()
+	case <-txCtx.Done():
+		return nil, txCtx.Err()
+	}
 
 	// 5. Execute transfer inside transaction
 	txErr := s.txManager.ExecuteInTx(txCtx, func(txRepos repository.Repositories) error {

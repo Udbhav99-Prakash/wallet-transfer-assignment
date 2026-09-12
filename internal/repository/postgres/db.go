@@ -19,6 +19,15 @@ type DBTX interface {
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
 }
 
+const (
+	// DefaultMaxConns defines default maximum connection pool limit.
+	DefaultMaxConns int32 = 30
+	// DefaultMinConns defines default minimum idle connection pool limit.
+	DefaultMinConns int32 = 5
+	// DefaultHeartbeatHeadroom defines reserved pool connections for background heartbeats and non-tx queries.
+	DefaultHeartbeatHeadroom int32 = 10
+)
+
 // NewPool initializes and tests a PostgreSQL connection pool.
 func NewPool(ctx context.Context, connString string) (*pgxpool.Pool, error) {
 	config, err := pgxpool.ParseConfig(connString)
@@ -26,8 +35,13 @@ func NewPool(ctx context.Context, connString string) (*pgxpool.Pool, error) {
 		return nil, fmt.Errorf("failed to parse postgres config: %w", err)
 	}
 
-	config.MaxConns = 30
-	config.MinConns = 5
+	// Preserve user-configured pool_max_conns from connString if specified; otherwise use DefaultMaxConns
+	if config.MaxConns <= 4 {
+		config.MaxConns = DefaultMaxConns
+	}
+	if config.MinConns <= 0 {
+		config.MinConns = DefaultMinConns
+	}
 	config.MaxConnLifetime = 1 * time.Hour
 	config.MaxConnIdleTime = 15 * time.Minute
 
@@ -45,6 +59,25 @@ func NewPool(ctx context.Context, connString string) (*pgxpool.Pool, error) {
 		return nil, fmt.Errorf("failed to connect to postgres: %w", err)
 	}
 
+	return pool, nil
+}
+
+// NewHeartbeatPool creates an isolated connection pool specifically for background idempotency lease heartbeats,
+// guaranteeing that burst transfer transactions can never starve heartbeat lease renewals.
+func NewHeartbeatPool(ctx context.Context, connString string) (*pgxpool.Pool, error) {
+	config, err := pgxpool.ParseConfig(connString)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse postgres config for heartbeat pool: %w", err)
+	}
+	config.MaxConns = 10
+	config.MinConns = 2
+	config.MaxConnLifetime = 1 * time.Hour
+	config.MaxConnIdleTime = 15 * time.Minute
+
+	pool, err := pgxpool.NewWithConfig(ctx, config)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create heartbeat pgxpool: %w", err)
+	}
 	return pool, nil
 }
 

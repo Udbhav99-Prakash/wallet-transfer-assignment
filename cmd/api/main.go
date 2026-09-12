@@ -55,8 +55,12 @@ func main() {
 	}
 	txManager := postgres.NewTxManager(pool)
 
-	// Construct services
-	transferService := service.NewTransferService(txManager, repos)
+	// Construct services with explicit transaction capacity reserving pool headroom for background heartbeats
+	maxConcurrentTransfers := int(cfg.DatabaseMaxConns - cfg.HeartbeatHeadroom)
+	if maxConcurrentTransfers <= 0 {
+		maxConcurrentTransfers = 20
+	}
+	transferService := service.NewTransferServiceWithCapacity(txManager, repos, maxConcurrentTransfers)
 	walletService := service.NewWalletService(txManager, repos)
 
 	// Construct handlers
